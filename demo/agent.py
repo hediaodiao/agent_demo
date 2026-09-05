@@ -1,3 +1,7 @@
+# 遗留代码（保留不删除）：当前运行入口是 graph.py（方案 B：LangGraph 手写 StateGraph）。
+# 本文件是方案 B 之前的早期手写 ReAct 版，import 的 RollingSummaryMemory / call_tool
+# 等符号在当前 memory.py / tools.py 中已不存在，直接运行会 ImportError。
+# 仅作对比学习用，请勿 import 到生产路径。
 """Agent 编排层。
 
 生产实践要点（对应我们讨论的）：
@@ -6,7 +10,10 @@
 2. 硬编码逻辑点：
    - 工具返回后 -> 结果已自带压缩（tools.py 里 format/truncate）
    - 每步写回上下文后 -> RollingSummaryMemory.maybe_compress() 检查 token 压早步
-3. 硬护栏：max_iterations 步数封顶，防无限循环（对应讨论的「硬护栏」）。
+3. 硬护栏：max_iter 步数封顶，防无限循环（对应 graph.py 的
+   recursion_limit=Settings.MAX_ITERATIONS——图步数护栏）。
+   注：本文件是单 Agent ReAct 循环，无「子 Agent 派单」概念，
+   故只有步数护栏，没有 graph.py 里 C10 的派单次数护栏（MAX_DISPATCHES）。
 4. 无状态化：历史从 session_store 按 session_id 取，Agent 本身不持有。
 5. Supervisor 多 Agent：主 Agent 分流到专家子 Agent（订单/问答/工单）。
 """

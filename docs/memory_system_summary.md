@@ -12,8 +12,12 @@
 - 容量限制：受模型上下文窗口限制（如GPT-4的128K tokens）
 - 主要作用：处理当前对话上下文
 
-> 注：工作记忆本身是**模型侧**的易失上下文（每次推理现取现用、用完即弃），LangChain 并没有专门"实现"它；下面那三个 LangChain Memory 类是对"会话历史如何暂存、下次再喂进工作记忆"的实现，归属**情景记忆**，见下方。
-
+> 注：工作记忆的**容器**本身是模型侧的易失上下文（每次推理现取现用、用完即弃），LangChain 并不提供这个"容器"本身；但它提供了 `ConversationBuffer` / `Window` / `Summary` 等工具，专门管理"**当前会话**的对话历史如何暂存、裁剪、摘要，再喂进工作记忆"——这些是对工作/短期记忆的**管理实现**（属工作/短期记忆，而非情景记忆）。情景记忆（第 2 节）是**带时间戳、可持久化、可按时间检索**的事件记录库；其典型形态是跨会话沉淀，但"跨会话"是部署结果而非定义强制。
+两点厘清：① 检索默认按 `thread_id` 限定在当前会话（当前会话消息在主流分类中称"对话历史/短期记忆"，本文档为简洁并入工作记忆）；跨会话需独立机制（LangGraph `Store` / PostgreSQL+pgvector 历史库）按 user_id 检索，不接则无。② 仅把当前 thread 状态持久化（如 checkpointer）仍是 thread 隔离的短期记忆，**不算情景记忆**；只有把交互带时间戳地沉淀进那个可跨会话检索的独立库，才成为情景记忆。
+**LangChain 三层记忆组件（工作/短期记忆管理，非情景记忆）**：
+- `ConversationBufferMemory`：把**当前会话**所有对话历史原样暂存 → 工作/短期记忆的"完整缓冲"策略
+- `ConversationBufferWindowMemory`：只保留当前会话最近 k 轮 → 工作/短期记忆的"滑动窗口"策略
+- `ConversationSummaryMemory`：自动摘要当前会话较早的对话 → 工作/短期记忆的"压缩/摘要"策略
 ---
 
 ### 2. 情景记忆（Episodic Memory）
@@ -37,12 +41,9 @@
 - 定期清理（保留30天）
 - 分层存储（热/温/冷）
 
-**LangChain 实现（会话历史的三种管理策略）**：
-- `ConversationBufferMemory`：存储所有对话历史 → 等价于本 demo 的 `MemorySaver`（完整 State 不裁剪）
-- `ConversationBufferWindowMemory`：只保留最近 k 轮 → 情景记忆的"滑动窗口"策略
-- `ConversationSummaryMemory`：自动摘要历史对话 → 情景记忆的"压缩/摘要"策略
-- 补充：`MemorySaver`（LangGraph checkpointer）按 `thread_id` 存完整会话 State，属情景记忆的"原样存储"实现；生产换成 Redis/Milvus 后仍是同一层（只是介质从进程内存变外部存储）。
-- 关键区分：这三类的本质是"把会话历史暂存、下次再喂进工作记忆"的机制，属于情景记忆，而非工作记忆本身（工作记忆是模型窗口里那块易失内容）。
+
+- 说明：`MemorySaver`（LangGraph checkpointer）按 `thread_id` 持久化**完整会话 State**，属于"跨会话的会话级状态存储"，更接近情景记忆的"原样存储"载体（前提是其真正跨运行持久化，而非仅本进程内存）；生产换成 **Redis** 是把它从进程内存变外部存储（仍是会话级状态），换成 **Milvus** 这类向量库则通常服务于**语义记忆**检索——二者**不是同一层**，勿混用。
+- 关键区分：这三类的本质是"把**当前会话**历史暂存/裁剪/摘要、再喂进工作记忆"的**工作/短期记忆管理机制**；情景记忆（见上）是**带时间戳、可持久化、可事后按时间检索**的事件记录库（如 PostgreSQL+pgvector、`ChatMessageHistory`+DB），典型形态为跨会话沉淀。当前会话的对话原文本就属于工作记忆，只有沉淀进那个持久库才成为情景记忆。
 
 ---
 
@@ -74,7 +75,7 @@
 | **时间属性** | 当前会话 | 有时间戳 | 无时间戳 |
 | **内容类型** | 对话历史 | 事件、经历 | 事实、知识 |
 | **描述方式** | 当前上下文 | "什么时候发生了什么" | "什么东西是什么" |
-| **存储位置** | 模型侧易失内存（每次推理现取现用） | 进程内存/PostgreSQL（MemorySaver、ChatMessageHistory） | 向量数据库 |
+| **存储位置** | 模型侧易失内存（每次推理现取现用） | 持久化历史库（典型跨会话）：PostgreSQL+pgvector（ChatMessageHistory+DB）/ 外部检查点（Redis 等） | 向量数据库 |
 | **检索方式** | 顺序读取 | 时间范围+向量 | 相似度检索 |
 | **生命周期** | 当前会话 | 长期（有取舍） | 长期（可更新） |
 
@@ -85,8 +86,8 @@
 ### Q1: LangChain中如何实现三层记忆？
 
 **A1**: 
-- **工作记忆**：模型侧易失上下文，LangChain 不专门"实现"它；`ConversationBufferMemory` 等其实是对"会话历史如何暂存、再喂进工作记忆"的实现，归属情景记忆（见情景记忆 LangChain 实现）。
-- **情景记忆**：用 `ChatMessageHistory` + 数据库持久化（或 `MemorySaver` 存完整 State），以及 `ConversationBufferMemory` / `Window` / `Summary` 三种历史管理策略。
+- **工作记忆**：模型侧易失上下文，LangChain 不专门"实现"它；`ConversationBufferMemory` / `Window` / `Summary` 这三类是对"**当前会话**历史如何暂存、裁剪、摘要，再喂进工作记忆"的**工作/短期记忆管理**实现（见情景记忆章节上方的 LangChain 组件说明），不属于情景记忆。
+- **情景记忆**：用 `ChatMessageHistory` + 数据库持久化（或 `MemorySaver` 跨运行存完整 State）沉淀成**带时间戳、可持久化、可事后检索**的历史库（PostgreSQL+pgvector），典型形态为跨会话。注意 `Buffer`/`Window`/`Summary` 管的是当前会话窗口，归工作记忆，不是情景记忆的策略。
 - **语义记忆**：LangChain不原生支持，需要向量数据库（Chroma/FAISS）+ 自定义管理
 
 ---

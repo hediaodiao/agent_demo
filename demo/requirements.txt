@@ -1,4 +1,4 @@
-# 生产级工单客服 demo —— 框架版（LangGraph + LangChain）
+# 生产级工单客服 —— 框架版（LangGraph + LangChain）
 # 安装：pip install -r requirements.txt
 # 注意：langgraph-supervisor 这里不用（我们手写 StateGraph，方案 B，便于学习）
 
@@ -9,7 +9,11 @@ langchain-openai>=0.2.0
 langchain-community>=0.3.0
 tiktoken>=0.6.0
 
-# 生产可选（本 demo 默认用内存版，接口已留好替换点）：
-# redis>=5.0          # 会话存储 / 向量库缓存
-# pgvector>=0.3.0     # 向量库（PostgreSQL + pgvector）
-# sentence-transformers>=3.0  # 本地 embed 模型（替代 OpenAI embed）
+# 情景记忆落库（生产级 PostgreSQL + pgvector，默认启用，不使用内存介质）
+langgraph-checkpoint-postgres>=2.0
+psycopg[binary]>=3.1
+pgvector>=0.2.5
+
+# 可选扩展（本 demo 默认不启用）：
+# redis>=5.0                 # 缓存 / 会话加速
+# sentence-transformers>=3.0 # 本地 embed 模型（替代 OpenAI embed）

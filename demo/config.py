@@ -19,7 +19,8 @@ class Settings:
     API_KEY = os.getenv("OPENAI_API_KEY", "")
 
     # 护栏 / 压缩阈值
-    MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "12"))   # 递归上限（硬护栏）
+    MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "12"))   # 图步数硬护栏（recursion_limit）：单次 invoke 节点执行总步数上限，防任意环死循环
+    MAX_DISPATCHES = int(os.getenv("MAX_DISPATCHES", "4"))    # 派单次数护栏（C10）：本轮最多派给几个不同专家，超了强制 farewell 收尾
     MAX_TOKEN_LIMIT = int(os.getenv("MAX_TOKEN_LIMIT", "4000"))  # 上下文压缩触发上限
     SUMMARY_TRIGGER_RATIO = 0.8   # 达到窗口 80% 开始压最早步骤
 
@@ -27,9 +28,25 @@ class Settings:
     CHUNK_SIZE = 400
     TOP_K = 5
 
+    # 情景记忆（C13：蒸馏结构化片段，同会话按需召回）
+    DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "001")          # 上线改为从请求上下文动态获取
+    EPISODIC_TOP_K = int(os.getenv("EPISODIC_TOP_K", "5"))         # 召回注入条数
+    SEMANTIC_TRIGGER_THRESHOLD = float(os.getenv("SEMANTIC_TRIGGER_THRESHOLD", "0.78"))  # 语义触发相似度下限
+
     @classmethod
     def has_real_key(cls) -> bool:
         return bool(cls.API_KEY) and cls.API_KEY != "sk-xxx"
+
+
+class SIGNAL_TYPE:
+    """情景记忆的 6 类信号（对齐 Mem0/HWC 生产做法）。"""
+    EVENT_OUTCOME = "event_outcome"   # 具体事件 + 结果
+    PREFERENCE = "preference"         # 用户偏好 / 习惯
+    FAILURE = "failure"               # 失败 / 异常 / 降级
+    COMMITMENT = "commitment"         # 承诺 / 待办
+    LESSON = "lesson"                 # 经验教训 / 处理方式
+    ANOMALY = "anomaly"               # 异常 / 边界 / 越权
+    CHOICES = [EVENT_OUTCOME, PREFERENCE, FAILURE, COMMITMENT, LESSON, ANOMALY]
 
 
 def _make(model: str, temperature: float = 0.2, max_tokens: int = 1024) -> ChatOpenAI:

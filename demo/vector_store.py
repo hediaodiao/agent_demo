@@ -19,8 +19,12 @@ from config import Settings
 
 
 def _fake_embed(text: str) -> List[float]:
-    """本地假 embed（无 API 时演示用）。生产替换为 OpenAIEmbeddings。"""
-    dim = 64
+    """本地假 embed（无 API 时演示用）。生产替换为 OpenAIEmbeddings。
+
+    ⚠️ 维度必须与 schema.sql 的 VECTOR(1536) 对齐（text-embedding-3-small 维度），
+    否则无 key 演示时写入 episodic_memory 会报维度不匹配。仅占位对齐，语义检索效果等同随机。
+    """
+    dim = 1536
     vec = [0.0] * dim
     for tok in re.findall(r"[\w\u4e00-\u9fff]+", text.lower()):
         h = int(hashlib.md5(tok.encode()).hexdigest(), 16)

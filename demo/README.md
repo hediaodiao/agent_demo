@@ -12,11 +12,32 @@
 | 编排 | **LangGraph** `StateGraph` | 手写 Supervisor 多 Agent 状态图 |
 | 子 Agent | **LangChain** `create_react_agent` | 每个专家是一个 react Agent（含工具循环） |
 | 工具 | **LangChain** `@tool` | 订单 / 知识库RAG / 工单 |
-| 向量库 | `OpenAIEmbeddings` + 内存 `VectorStore` | 生产换 Milvus/Qdrant/pgvector |
-| 会话存储 | 内存 `InMemorySessionStore` | 生产换 Redis（带 TTL） |
+| 向量库（RAG） | `OpenAIEmbeddings` + 内存 `VectorStore` | 生产换 Milvus/Qdrant/pgvector |
+| **情景记忆落库** | **PostgreSQL + pgvector**（`PostgresSaver`） | 按 `thread_id` 持久化会话，**非内存介质** |
+| 语义记忆 | **未实现** | opt-in 跨会话画像（标准非默认，见「三层记忆」） |
 | LLM | `ChatOpenAI` | 决策大模型 + 压缩小模型分离 |
 
 ## 运行
+
+### 前置：情景记忆数据库（PostgreSQL + pgvector）
+
+情景记忆**不使用内存介质**，必须先准备 PostgreSQL：
+
+```bash
+# 1) 安装 pgvector 扩展（依发行版而定），然后建库
+createdb agent_db
+
+# 2) 启用扩展 + 建表
+psql -f schema.sql "postgresql://user:pass@localhost:5432/agent_db"
+
+# 3) 配置连接串（生产禁止硬编码凭据）
+set POSTGRES_URI=postgresql://user:pass@localhost:5432/agent_db
+```
+
+> 未配置 `POSTGRES_URI` 时 `db.get_postgres_uri()` 会 fail fast 并打印上述步骤。
+> checkpointer 表也可由 `checkpointer.setup()` 建立（见 `schema.sql` 注释）。
+
+### 启动
 
 ```bash
 pip install -r requirements.txt
@@ -24,7 +45,7 @@ set OPENAI_API_KEY=你的key
 set OPENAI_BASE_URL=https://your-endpoint   # 可选，兼容端点/自建 vLLM
 
 python main.py                  # 交互式对话
-python main.py --session user1  # 指定 session_id（无状态化演示）
+python main.py --session user1  # 指定 thread_id（无状态化演示）
 python test_demo.py             # 端到端冒烟测试（验证分流路由）
 ```
 
@@ -32,16 +53,57 @@ python test_demo.py             # 端到端冒烟测试（验证分流路由）
 
 | 我们讨论的要点 | 在代码里的位置 |
 |---|---|
-| **多 Agent（Supervisor）** | `graph.py`：`supervisor` 节点做意图分类 + `add_conditional_edges` 分流到 order/qa/ticket |
+| **多 Agent（Supervisor）** | `graph.py`：`supervisor` 节点做意图分类 + `add_conditional_edges` 分流到 order/qa/ticket；调度台会被告知「本轮已产出的专家结论」，避免重复派单死循环 |
+| **Supervisor 汇总（多专家整合）** | `graph.py` `answer_node`：单专家**透传**（零额外 LLM）；多专家把中间结论**整合**成一条连贯回复；纯客套走模板收尾语。它是本轮**唯一最终回复出口** |
 | **子 Agent 是独立实例** | `graph.py`：`order_agent/qa_agent/ticket_agent` 各用 `create_react_agent` 封装 |
 | **工具返回压缩（第1块）** | `tools.py`：`query_orders` 用 `_format_orders` 裁剪；`rag_search` 过长用小模型摘要 |
-| **上下文滚动摘要（第2块）** | `memory.py`：`compress_history`（token 计数触发，压最早步骤）；`chat()` 入口示意调用 |
+| **工具/子Agent结果只留结论（第1块扩展）** | `graph.py` `_run_subagent` + `_extract_conclusion`：子 Agent 的 `tool_calls`/`ToolMessage` **不回传**主上下文，只回最后一条 AI 结论 |
+| **上下文滚动摘要（第2块）** | `memory.py`：`compress_history` + `count_messages_tokens`（**token 计数**触发，压最早轮）；`graph.py` `compress_node` 在每轮子 Agent 后检查 |
 | **单轮超长走 RAG** | `vector_store.py` + `tools.rag_search`：算「问题 vs 片段」相似度 |
-| **无状态化 + 状态外置** | `session_store.py`；LangGraph `MemorySaver` 用 `thread_id` 管理历史 |
-| **步数封顶（硬护栏）** | `graph.py`：`compile(recursion_limit=Settings.MAX_ITERATIONS)` |
+| **无状态化 + 状态外置** | `db.get_checkpointer()`：`PostgresSaver` 按 `thread_id` 落盘（`session_store.py` 为遗留，未引用） |
+| **情景记忆（蒸馏 + 按需召回）** | `graph.py` `answer_node`：每轮后台线程异步 LLM 蒸馏成 0~N 条结构化 episode 写 `episodic_memory`（全量原文不再落库）；`recall_node` 在会话开场按「实体/语义触发」按需召回 top-K 注入上下文，**不每轮无脑查** |
+| **checkpointer = 短期 / 工作记忆持久化** | `db.get_checkpointer()`：`PostgresSaver` 按 `thread_id` 落 `checkpoints` 表（state 快照），即 LangGraph 的短期记忆（thread-scoped，管会话连续性 / 断点恢复 / 无状态化）；**不是记忆分层**，生产定期裁剪 |
+| **步数封顶（硬护栏 / 图步数）** | `graph.py`：`compile(recursion_limit=Settings.MAX_ITERATIONS)` —— 单次 invoke 节点执行**总步数**上限，防任意环死循环 |
+| **派单次数护栏（C10 / 逻辑层）** | `graph.py` `supervisor`：`len(called_agents) >= Settings.MAX_DISPATCHES`（默认 4）强制 `farewell` 收尾，杜绝重复派同一专家 / 无限派单。与图步数护栏 `MAX_ITERATIONS` **语义解耦**：前者数「本轮不同专家派单次数」，后者数「节点执行步数」，是两种不同计数器 |
 | **降级 / 备用数据源** | `tools.query_orders`：主源挂了切 CSV 备胎 |
 | **压缩用小模型** | `config.get_llm("small")`；`memory.summarize_with_small_model` 用它 |
 | **循环骨架框架封装 vs 业务硬编码** | `create_react_agent` 给子 Agent 循环；工具压缩/`compress_history`/supervisor 路由是你写的 |
+
+## 记忆（生产口径，对齐主流 agent taxonomy）
+
+| 层 | 存什么 | 何时写 | 介质 | 作用域 |
+|---|---|---|---|---|
+| **短期记忆（short-term / working）** | 会话连续性所需的对话历史：checkpointer 持久化的 state 快照（含压缩后 `[摘要]+[最近k轮]`）；被 `load` 进窗口即充当「工作记忆」 | 每节点产出自动落 `checkpoints`；下轮 `load(thread_id)` 回 | checkpointer（`checkpoints` 表） | 单 `thread_id` |
+| **情景记忆（蒸馏结构化片段 / episodic）** | 每轮 `answer_node` 后台异步蒸馏的 0~N 条 episode：`signal_type`(事件/偏好/失败/承诺/教训/异常) + `content`(发生了什么+结果) + `entities`(可检索标签) + `importance`(1-5)，带 `ts`+`embedding`；**全量原文不再落库** | 每轮 `answer_node` 后异步写（不阻塞回复，与压缩解耦）；`recall_node` 会话内按需召回（实体/语义触发） | `episodic_memory` 表（PostgreSQL + pgvector） | 单 `thread_id`，**默认不跨会话** |
+| **语义记忆** | 用户级事实/画像（**未实现**） | opt-in：规则实时(60%) + 事件触发(5%) + 每日批量(35%)，绝不每轮调 LLM | 向量库 | 跨会话（**非默认**） |
+
+⚠️ 易混点（面试高频）：
+
+- **情景记忆（本项目 = `episodic_memory`，宽泛/生产常见口径）**：按时间存成结构化 episode（发生了什么+结果+标签），由 `recall_node` 按需召回注入上下文——本场景为企业内部助手、无审计，故只存蒸馏片段、不存全量原文，即主流 chatbot 的 episodic memory。**严格 agent 工程定义（episodic=带反思的任务轨迹、跨会话学经验）属进阶 opt-in，本 demo 未做；口语/宽泛认知定义下本表即情景记忆。**
+- **checkpointer（`checkpoints` 表）是短期记忆的持久化实现**，不是"另一套情景记忆"；与 `episodic_memory` 是独立表、独立用途：前者给框架恢复+续聊（每节点一份快照），后者给会话内按需召回精确细节。
+- **⚠️ 别把「checkpointer 的 load」和「情景记忆召回」混为一谈**：checkpointer 的 `load(thread_id)` 是**每轮框架自动恢复会话**（短期记忆/续聊连贯性，发生在 `recall_node` 之前）；情景记忆的召回是 `recall_node` **按需触发**（用户提订单/工单号或说"之前/那个"时，捞回 `episodic_memory` 蒸馏片段注入上下文）。这是**两套不同的「读」**——前者保"接着聊"，后者补"被压缩掉的精确细节"。
+- **`[历史摘要] + [最近 k 轮]` 是短期记忆被 load 进窗口后的「工作态」**，其来源就是 `checkpoints` 表，不是凭空现拼；压缩只裁剪"喂给模型的内容"，不裁剪库里存的全量。
+- 子 Agent 的 `tool_calls` / `ToolMessage` **不落盘**（只在内存里，invoke 完即弃）；多专家时的**中间结论**也**不入库**，只有整合后的最终回复入库。
+
+## 「无状态」到底什么意思
+
+**无状态 = 服务实例不持有会话数据，不是"模型只看本轮提问"。**
+
+- ❌ 有状态：历史存在某进程内存里 → 请求必须路由回同一实例，重启/扩容就丢。
+- ✅ 无状态：数据在 PostgreSQL 里按 `thread_id` 存着 → 任意实例可服务任意请求，重启不丢，可水平扩容。
+
+每轮实际流程：
+
+1. `load(thread_id)` 取回该会话历史；
+2. 组装 `[历史摘要] + [最近 k 轮] + [本轮提问]`；
+3. 喂给模型 —— **模型看到的是"历史 + 本轮"，不是孤零零一句提问**。
+
+## 存储成本（每条都存会不会爆）
+
+- 算账：一条清洗后文本 ≈ 100 B ~ 几 KB；20 轮会话 = 40 行 ≈ **20 KB**；100 万会话 ≈ **20 GB**（PG 压缩后更小，单表可承受）。
+- 真正会撑爆的是**长文档 / 图片 / 工具返回原始 JSON** —— 生产一律**外置对象存储（S3 / MinIO），对话表只存引用**。本项目工具返回本就不进历史。
+- 长期成本四招（标准 Q6）：分层存储(热/温/冷) + 定期清理(保留期) + 旧会话摘要化（已预留 `summary` 列）+ 大 payload 外置。
+- `checkpoints` 表要单独清理：它是**每节点一份全量 state 拷贝**，生产按「每线程保留最近 K 份」或「超 N 天删除」裁剪（框架默认不自动清理，需自己写定时任务）。
 
 ##  复习路径（读代码顺序）
 
@@ -55,16 +117,19 @@ python test_demo.py             # 端到端冒烟测试（验证分流路由）
 
 | Demo 里 | 生产替换为 |
 |---|---|
-| `InMemorySessionStore` | Redis（带 TTL）/ PostgreSQL + JSON |
 | `VectorStore`（内存+假 embed） | Milvus / Qdrant / pgvector + 真实 embed |
-| `MemorySaver` checkpointer | Redis/Postgres checkpointer（持久化、可恢复） |
+| `PostgresSaver` 单点 | 连接池调优 + 读写分离 / 托管 PG（情景记忆主库） |
 | `get_llm` 默认端点 | 自建 vLLM / 第三方网关（模型路由：简单用小模型） |
 | 手写 supervisor | 若流变复杂可升 `langgraph-supervisor` 或加人工审核节点 |
+| 语义记忆（未实现） | 如需跨会话画像：向量库 + 按 `user_id` namespace 的 opt-in 画像层 |
+
+> 已移除的替换点：`InMemorySessionStore`（遗留，未被引用）、`MemorySaver`（已换 `PostgresSaver`）。
 
 ## 注意
 
-- `messages.py` 为旧手搓版遗留，已弃用，统一用 `langchain_core.messages`。
-- 本 demo 默认**内存可跑结构**，但**真正调 LLM 需要 OPENAI_API_KEY**（无 key 时 import 正常、调用会报错，这是预期）。
+- **必须先准备 PostgreSQL + pgvector**（见「前置：情景记忆数据库」），情景记忆不使用内存介质。
+- 真正调 LLM 需要 `OPENAI_API_KEY`；无 key 时 import 正常、调用会报错（这是预期）。
+- 遗留文件（保留不删除，当前方案未引用）：`agent.py`、`session_store.py`、`messages.py`，详见下方分类。
 
 
 
@@ -77,24 +142,33 @@ python test_demo.py             # 端到端冒烟测试（验证分流路由）
 | `requirements.txt` | 依赖声明（langgraph/langchain 等） |
 | `config.py` | LLM 工厂，`get_llm("big"/"small")` 大小模型分离 |
 | `vector_store.py` | RAG 向量库（切分/embed/检索、上传入库、删文件清向量） |
-| `session_store.py` | 会话状态外置（内存版 + Redis 生产版注释） |
+| `db.py` | **情景记忆落库**：`get_checkpointer()`(PostgresSaver) + `insert_episodic_turn` + `search_episodic_by_vector`（后两者默认不接线） |
+| `schema.sql` | **数据库 DDL**：pgvector 扩展 + checkpointer 表 + `episodic_memory` 表（原文+向量同表）+ 向量索引 |
 | `tools.py` | LangChain `@tool` 工具集（订单/问答/工单 + 工具返回压缩 + 降级） |
-| `memory.py` | 小模型摘要 + `compress_history` 滚动压缩逻辑 |
-| `graph.py` | **核心**：StateGraph 手写 Supervisor + 3 个子 Agent 节点 + 条件路由 |
-| `agent.py` | 子 Agent 轻量 ReAct 循环骨架 |
+| `memory.py` | 小模型摘要 + `compress_history` 滚动压缩 + `count_messages_tokens` 统一 token 口径 |
+| `graph.py` | **核心**：StateGraph 手写 Supervisor + 3 个子 Agent 节点 + 条件路由 + 压缩节点 + 汇总作答节点(`answer`) |
+| `session_store.py` | ⚠️ 遗留（未被引用，见下方） |
+| `agent.py` | ⚠️ 遗留（早期手写 ReAct 版，import 已失效，见下方） |
 | `main.py` | 框架版入口 |
 | `test_demo.py` | 测试脚本 |
 | `README.md` | 教学说明，映射生产要点 |
 
-## 不用管的文件（1.0 可忽略）
+## 不用管的文件（遗留，保留不删除）
 
-- **`messages.py`** — 旧手搓版残留，文件第 1 行已写明：`"此文件为「手搓版」遗留，已被 langchain_core.messages 取代，请勿使用。"` 框架版统一用 `langchain_core.messages`，不会 import 它，可直接无视（也可删掉，不影响运行）。
-- **`_smoke_test.py`** — 临时冒烟测试文件（命名带下划线前缀），非核心交付物，仅供快速验证语法/跑通用，可不用管。
+- **`agent.py`** — 早期手写 ReAct 版（方案 B 之前）。它 import 的 `RollingSummaryMemory` / `call_tool` 在当前 `memory.py` / `tools.py` 中已不存在，**直接运行会 ImportError**。当前运行入口是 `graph.py`，本文件未被引用。
+- **`session_store.py`** — 会话存储抽象（内存版 + Redis 注释版）。`graph.py` 已用 LangGraph checkpointer（`PostgresSaver`）实现状态外置，本文件**未被引用**，仅作对比示例。
+- **`messages.py`** — 旧手搓版消息类残留，已被 `langchain_core.messages` 取代，请勿使用。
+- **`_smoke_test.py`** — 临时冒烟测试文件（命名带下划线前缀），非核心交付物。
 
-简单说：**`messages.py` 明确弃用不用看；其余 `.py` + `README.md` + `requirements.txt` 都是当前版本有用的**。`_smoke_test.py` 是辅助测试，非必读。
+简单说：**这 4 个文件当前方案都不参与运行**，保留仅供对比学习；其余 `.py` + `README.md` + `requirements.txt` + `schema.sql` 都是当前版本有用的。
 
 
 # 递归查找所有大文件
 Get-ChildItem -Recurse -File | Where-Object { $_.Length -gt 100MB } | 
     Select-Object FullName, 
         @{Name="Size(MB)";Expression={[math]::Round($_.Length/1MB,2)}}
+
+1.为什么必须：它是 AgentState 的字段，会随 checkpointer 落盘、跨轮保留。若不重置，第二轮用户再问"订单"时，"order" 可能还躺在上一轮累积的列表里 → 被 C10 硬护栏误判成"重复派单" → 强制 farewell → 答不出来。所以每轮开头清空，只在本轮内累计
+
+
+白板 = 累积的 state；checkpointer = 给白板每步拍快照存盘的机制；它落到的 checkpoints 表，是 LangGraph 库为实现"按步存档/恢复"而写死表名与结构的一张专用表，不是我们的业务表、也不是你能改名的可配项
