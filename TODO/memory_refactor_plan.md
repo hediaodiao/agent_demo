@@ -247,15 +247,77 @@ CREATE INDEX IF NOT EXISTS idx_episodic_embed ON episodic_memory
 
 | # | 时间 | 文件 | 改动事项（一句话看懂改了什么） | 改动内容 | 对齐理由 | 是否完成 | 备注 |
 |---|---|---|---|---|---|:---:|---|
-| **C13-1** | 2026-09-05 | `schema.sql` | **把"逐轮全量对话记录表"改造成"结构化情景记忆表"**：不再整段存聊天原文，只存提炼后的关键信息，并给每条记忆标注「来源用户、记忆类型、重要程度、可检索标签」 | `episodic_memory` 表改造：删 `role`/`summary` 列；新增 `user_id`(TEXT, 默认'001')、`signal_type`(TEXT, 6类枚举+检查约束)、`entities`(JSONB)、`importance`(SMALLINT 1-5)；保留 `thread_id`/`content`/`embedding`/`ts`；注释改为"蒸馏后的情景记忆(同会话按需召回)"；保留 `idx_episodic_thread_ts`，新增 `entities` GIN 索引 | 无审计内部助手应存"蒸馏结构化摘要"而非全量原文（Mem0/HWC 主流）；`entities` 支持精确检索、`importance` 排序、`signal_type` 区类型 | ⬜ | 6类枚举：event_outcome / preference / failure / commitment / lesson / anomaly |
-| **C13-2** | 2026-09-05 | `db.py` | **把记忆写入从"存原文对话"改为"批量写入提炼后的结构化记忆并生成语义向量"**，同时补上「按标签精确查找」的能力，让记忆检索真正可用 | `insert_episodic_turn` → `insert_episodic_memories(episodes:list[dict])` 批量写，每条含 `signal_type/content/entities/importance/embedding`；复用 `vector_store.Embedder` 算 embedding（修掉之前 NULL）；`search_episodic_by_vector` 改为返回完整 episode(content+entities)、top-K 全量(按 `importance DESC, ts DESC`)；新增 `search_episodic_by_entities(thread_id, entities)` 做 JSONB 精确匹配 | 写入带向量才能真正检索；Hybrid Search=实体精确+向量语义；全量召回=不按 importance 过滤 | ⬜ | 旧 `role/summary` 参数删除；⚠️ 演示 fake embed 当前 64 维，需对齐 `VECTOR(1536)`（改 `_fake_embed` 维度为 1536），否则无 key 时插入报维度错 |
-| **C13-3** | 2026-09-05 | `graph.py` | **每轮回复用户后，在后台自动把本轮对话"总结提炼"成几条记忆入库**：不影响回复速度、不再落库原文 | `answer_node` 各分支产出最终回复后，启**后台线程 fire-and-forget** 调蒸馏：把"本轮 user 原话 + 主Agent最终回复 + 涉及专家"喂 small 模型(structured output)提炼 0~N 条 episode 写库；不阻塞返回 | 异步蒸馏=主流（每轮后提炼但不卡回复）；全量原文不再落库 | ⬜ | 子 Agent 中间结论/工具调用不进；失败仅打日志不阻断 |
-| **C13-4** | 2026-09-05 | `graph.py` | **新增"记忆召回"环节**：用户提到具体订单/工单或说"之前/那个"时，才从本会话历史里捞回相关记忆补进上下文；平时不查，避免无关信息干扰 | 新增 `recall_node`（插在 `START → supervisor` 之间）：读当前输入，①实体触发=输入命中 `entities` JSONB 即查；②语义触发=无实体命中时算输入 embedding 与同 thread 近期 episode 相似度 >0.78 且含指代词("之前/那个/刚才")才查；命中则捞 top-K 注入一条 `SystemMessage`"【相关历史记忆】\n..."；不命中返回 `{}` 不注入 | 触发性检索（非每轮无脑查）：避免延迟/噪声；不跨会话故无"开场预热" | ⬜ | top-K=5；不触发时只靠 checkpointer 工作记忆 |
-| **C13-5** | 2026-09-05 | `config.py` | **把记忆相关参数集中到配置文件**：默认用户、召回条数、触发阈值、记忆类型等都在此统一管理，方便上线调整 | 新增 `DEFAULT_USER_ID="001"`、`EPISODIC_TOP_K=5`、`SEMANTIC_TRIGGER_THRESHOLD=0.78`；定义 `SIGNAL_TYPE` 枚举 | 集中配置，避免硬编码 | ⬜ | `user_id` 上线改为动态获取 |
-| **C13-6** | 2026-09-05 | `graph.py`+`schema.sql` 注释 | **同步更新文档说明**：把记忆描述从"全量对话归档"改为"蒸馏后的结构化情景记忆"，消除文档与代码不一致 | 顶部"三层记忆"说明及 `schema.sql` 注释中"情景记忆=逐轮全量"改为"蒸馏结构化片段(同会话按需召回)"；`checkpointer` 仍为短期记忆持久化（C12 前已改） | 与实现一致，消除文档/代码错位 | ⬜ | 语义记忆仍不实现 |
+| **C13-1** | 2026-09-05 | `schema.sql` | **把"逐轮全量对话记录表"改造成"结构化情景记忆表"**：不再整段存聊天原文，只存提炼后的关键信息，并给每条记忆标注「来源用户、记忆类型、重要程度、可检索标签」 | `episodic_memory` 表改造：删 `role`/`summary` 列；新增 `user_id`(TEXT, 默认'001')、`signal_type`(TEXT, 6类枚举+检查约束)、`entities`(JSONB)、`importance`(SMALLINT 1-5)；保留 `thread_id`/`content`/`embedding`/`ts`；注释改为"蒸馏后的情景记忆(同会话按需召回)"；保留 `idx_episodic_thread_ts`，新增 `entities` GIN 索引 | 无审计内部助手应存"蒸馏结构化摘要"而非全量原文（Mem0/HWC 主流）；`entities` 支持精确检索、`importance` 排序、`signal_type` 区类型 | ✅ | 6类枚举：event_outcome / preference / failure / commitment / lesson / anomaly |
+| **C13-2** | 2026-09-05 | `db.py` | **把记忆写入从"存原文对话"改为"批量写入提炼后的结构化记忆并生成语义向量"**，同时补上「按标签精确查找」的能力，让记忆检索真正可用 | `insert_episodic_turn` → `insert_episodic_memories(episodes:list[dict])` 批量写，每条含 `signal_type/content/entities/importance/embedding`；复用 `vector_store.Embedder` 算 embedding（修掉之前 NULL）；`search_episodic_by_vector` 改为返回完整 episode(content+entities)、top-K 全量(按 `importance DESC, ts DESC`)；新增 `search_episodic_by_entities(thread_id, entities)` 做 JSONB 精确匹配 | 写入带向量才能真正检索；Hybrid Search=实体精确+向量语义；全量召回=不按 importance 过滤 | ✅ | 旧 `role/summary` 参数删除；⚠️ 演示 fake embed 维度已对齐 1536（坑一已修） |
+| **C13-3** | 2026-09-05 | `graph.py` | **每轮回复用户后，在后台自动把本轮对话"总结提炼"成几条记忆入库**：不影响回复速度、不再落库原文 | `answer_node` 各分支产出最终回复后，启**后台线程 fire-and-forget** 调蒸馏：把"本轮 user 原话 + 主Agent最终回复 + 涉及专家"喂 small 模型(structured output)提炼 0~N 条 episode 写库；不阻塞返回 | 异步蒸馏=主流（每轮后提炼但不卡回复）；全量原文不再落库 | ✅ | 子 Agent 中间结论/工具调用不进；失败仅打日志不阻断 |
+| **C13-4** | 2026-09-05 | `graph.py` | **新增"记忆召回"环节**：用户提到具体订单/工单或说"之前/那个"时，才从本会话历史里捞回相关记忆补进上下文；平时不查，避免无关信息干扰 | 新增 `recall_node`（插在 `START → supervisor` 之间）：读当前输入，①实体触发=输入命中 `entities` JSONB 即查；②语义触发=无实体命中时算输入 embedding 与同 thread 近期 episode 相似度 >0.78 且含指代词("之前/那个/刚才")才查；命中则捞 top-K 注入一条 `SystemMessage`"【相关历史记忆】\n..."；不命中返回 `{}` 不注入 | 触发性检索（非每轮无脑查）：避免延迟/噪声；不跨会话故无"开场预热" | ✅ | top-K=5；不触发时只靠 checkpointer 工作记忆 |
+| **C13-5** | 2026-09-05 | `config.py` | **把记忆相关参数集中到配置文件**：默认用户、召回条数、触发阈值、记忆类型等都在此统一管理，方便上线调整 | 新增 `DEFAULT_USER_ID="001"`、`EPISODIC_TOP_K=5`、`SEMANTIC_TRIGGER_THRESHOLD=0.78`；定义 `SIGNAL_TYPE` 枚举 | 集中配置，避免硬编码 | ✅ | `user_id` 上线改为动态获取 |
+| **C13-6** | 2026-09-05 | `graph.py`+`schema.sql`+`README.md` 注释 | **同步更新文档说明**：把记忆描述从"全量对话归档"改为"蒸馏后的结构化情景记忆"，消除文档与代码不一致 | 顶部"三层记忆"说明、`schema.sql` 注释、`README` 护栏行与记忆章节中"情景记忆=逐轮全量"改为"蒸馏结构化片段(同会话按需召回)"；`checkpointer` 仍为短期记忆持久化（C12 前已改） | 与实现一致，消除文档/代码错位 | ✅ | 语义记忆仍不实现 |
 
 **下一轮主模型收到的信息（改造后）**：
 1. 永远有：checkpointer 工作记忆 `[历史摘要]+[最近k轮 user+主Agent回复]` + 本轮用户输入；
 2. 仅触发时有：`recall_node` 注入的 top-K 蒸馏 episode（实体/语义命中，补回被压缩掉的精确细节）；
 3. 永远没有：跨会话历史、子 Agent `tool_calls`/`ToolMessage`、全量原文逐字稿。
+<!-- write-probe -->
+
+
+---
+
+## 十四、第三轮：工作记忆压缩与主流对齐（D 系列，2026-09-08 提出，已确认待执行）
+
+> **起因**：多轮讨论确认当前压缩实现与主流（LangMem 等）不匹配，需要调整：
+> 压缩只在子 Agent 跑完后触发、纯客套轮永不压；触发阈值单一且偏高（80%）；
+> 保留策略按固定"最近 3 轮"而非 token 预算；进行中轮爆表无兜底；
+> 摘要无独立字段、靠第 0 条 SystemMessage 伪装成"伪轮"传递。
+> **状态**：表 1 / 表 2 / 表 3 与关联 todo 均已确认，待按 c1→c7 执行。
+
+### 关联 todo（codebuddy todo 面板 c1–c7）
+
+| todo | 主题 | 对应表3编号 |
+|---|---|:---:|
+| c1 | 配置收口：config.py 单阈值拆两档 + 预算常量 | #1 |
+| c2 | 入口压缩节点：graph.py 接线「召回→压缩→路由」 | #11 |
+| c3 | 触发判定两档化：压缩函数三态判定 | #2 |
+| c4 | 预算切分保留：固定最近 3 轮 → token 预算切分 | #3 |
+| c5 | 单轮爆表兜底：折叠进行中轮 + 逐条裁剪 + 摘要净化 | #4/#5/#6 |
+| c6 | 滚动摘要显式化：状态新增摘要字段 + 函数签名改造 | #8/#9 |
+| c7 | 回归验证：多轮/多专家/长窗 demo 会话 | — |
+
+### 表 1：目前代码的问题（与主流做法不匹配处）
+
+| # | 问题（现状） | 与主流做法的差异 | 后果 |
+|---|---|---|---|
+| 1 | **压缩时机过窄**：只在子 Agent 跑完后检查；入口、路由首次调用前、纯客套轮（不派子 Agent）都不检查 | LangMem/主流是"每个模型调用前都有一道预算卡点"，尤其每轮入口必查一次 | 纯客套轮可以无限累积不触发压缩；某轮入口时窗口已超限，路由第一次调用就超窗 |
+| 2 | **触发阈值太高**：窗口用到 80% 才动手压 | 主流用较低阈值"软触发"提前把最老历史滚进摘要，避免一次压太多 | 一次要压很多轮，摘要体量变大、损失更多细节 |
+| 3 | **保留策略按"轮数"不看预算**：固定保留最近 3 轮原文，不量 token | 主流是"从最新往最旧累计 token，预算内保留、超出滚摘要" | 若近 3 轮本身很大（尤其当前轮结论多），压完仍然超窗——"压了个寂寞" |
+| 4 | **单轮爆表无兜底**：进行中的轮（还没到每轮末尾的整合点）若自身就超预算，现逻辑仍把它整体当原文保留 | 主流对超预算部分一视同仁地滚进摘要/折叠 | 极端长轮（单轮多专家、结论冗长）压不动窗口 |
+| 5 | **摘要没有独立承载字段**：历史摘要只能伪装成"摘要消息"放在列表第 0 位，靠字符串前缀识别，还会被切轮逻辑当成一个"伪轮"参与下次压缩 | 主流把"滚动摘要"作为状态的独立字段，能单独预算、单独传递 | 摘要语义靠前缀字符串维系、脆弱；"最近 k 轮"的 k 实际在漂移（= 上次压缩点至今，不是常数 3），无法解释也难以管理 |
+| 6 | **触发过的压缩形态"不确定"**：下一轮 load 回的是否压缩态取决于上一轮有没有机会触发 | 主流不依赖"运气"，入口固定校准一次 | 与问题 1 同根，导致每次推理都要先猜窗口长什么样 |
+
+> 值得强调的"非问题"（与主流一致、保留不动）：子 Agent 内部工具循环不进主窗（源头只回结论）；每个完整轮在末尾的整合节点被规范成"一问一答"；历史轮因此是干净的。
+
+### 表 2：整体调整事项
+
+| 事项 | 一句话说明 | 修的问题 |
+|---|---|---|
+| A. 压缩时机对齐"入口 + 节点后" | 新增**入口压缩**（召回后、路由前），子 Agent 后那道保留；纯客套轮也被入口兜住 | 问题 1、6 |
+| B. 阈值分级 | 一个较低阈值做**软触发**（提前滚老历史），一个硬顶做**强制裁剪** | 问题 2 |
+| C. 切分单位从"轮数"改"token 预算" | 从最新向最旧逐轮累计，预算内整轮保留原文，超出的轮滚进摘要 | 问题 3 |
+| D. 单轮爆表兜底 | 进行中的轮若单独超预算 → 先折叠其内部多条子 Agent 结论，仍超再逐条裁 | 问题 4 |
+| E. 摘要显式滚动 | 状态里新增**滚动摘要字段**；每次压缩用"旧摘要 + 新超预算轮"更新它，不再伪装成伪轮 | 问题 5 |
+| F. 相关数值收进配置文件 | 阈值、保留预算等集中一处 | —（工程性） |
+
+### 表 3：详细调整点（时间 = 会话日期，沿用 M/C 系列口径）
+
+| 编号 | 位置 | 现状 | 要改成 | 对应事项 | 时间 | 改动内容 |
+|---|---|---|---|---|---|---|
+| #11 | 图结构（graph.py） | 入口为「召回 → 路由」直连 | 插入「召回 → 压缩 → 路由」，压缩函数超限才动、未超零成本返回 | A、问题 1/6 | 2026-09-08 | `builder.add_edge("recall", "supervisor")`（graph.py:467）改为先 `add_edge("recall","compress")` 再 `add_edge("compress","supervisor")`；直接复用 `compress_node`（graph.py:421-441） |
+| #1 | 配置（config.py） | 单一高阈值（80%） | 拆成两档：软触发阈值（约窗口 60%，用于提前滚摘要）+ 硬顶（约 80%，压完必须低于它）；集中定义保留预算等常量 | B、问题 2 | 2026-09-08 | `Settings` 内 `MAX_TOKEN_LIMIT`(24行)/`SUMMARY_TRIGGER_RATIO`(25行) 处新增 `SOFT_TRIGGER_RATIO=0.6`、`HARD_LIMIT_RATIO=0.8`、保留预算与摘要体量上限常量；`SUMMARY_TRIGGER_RATIO` 改名/废弃 |
+| #2 | 压缩函数触发判定（memory.py） | 只看是否超单阈值 | 按两档判定：低于软触发 → 原样返回；软触发~硬顶 → 滚动最老轮至预算内；超硬顶 → 强制裁到硬顶内 | B | 2026-09-08 | `compress_history` 触发判断段（memory.py:113-119）改三态；`compress_node` 的 `trigger` 计算（graph.py:435-437）同步用两档替换单阈值 |
+| #3 | 压缩函数切分逻辑（memory.py） | 固定保留最近 3 轮原文，更早轮逐轮摘要 | 从最新向最旧逐轮累计 token，预算内整轮保留、其余轮并入摘要；摘要产物控制体量上限（约占窗口一小部分） | C、问题 3 | 2026-09-08 | 重写 `compress_history`（memory.py:112-142）：删 `keep_recent_turns=3` 固定切片（118、122-123 行），改 `reversed(turns)` 逐轮累计 token 至保留预算；摘要 `max_chars`(131行) 按窗口比例给 |
+| #4 | 压缩函数兜底（memory.py） | 无（保留区可能仍超） | 预算内保留部分仍超硬顶时，对最新一轮内部逐条裁剪，直到低于硬顶 | C/D、问题 4 | 2026-09-08 | 压缩函数组返回值前（memory.py:142 附近）校验"保留区 ≤ 硬顶"，否则对最新一轮从较旧的 AI 结论起逐条裁，直到低于硬顶 |
+| #5 | 压缩辅助函数（memory.py 新增） | 无（进行中的多结论轮从不折叠） | 新增"折叠进行中轮"：只留本轮提问 + 最新一条答复，把该轮内多条子 Agent 结论合并为一条 | D、问题 4 | 2026-09-08 | 新增 `_collapse_turn(turn)`：取第一条 HumanMessage + 最后一条 AIMessage、丢弃中间多条子 Agent 结论；保留区仍超硬顶时对最新一轮调用 |
+| #6 | 轮转文本（memory.py） | 把轮内所有消息（含工具消息，若偶入）拼成文本再摘要 | 转换文本时跳过工具类消息，只留问答正文 | D（防御性） | 2026-09-08 | `_turn_to_text`（memory.py:69-79）循环里 `if isinstance(m, ToolMessage): continue`，只拼问答正文 |
+| #8 | 状态结构（graph.py） | 无摘要字段 | 状态新增"滚动摘要"文本字段 | E、问题 5 | 2026-09-08 | `AgentState`（graph.py:88-91）新增 `summary: str`——覆盖式字段（不挂累加 reducer，否则会被翻倍） |
+| #9 | 压缩函数签名与写回（memory.py + graph.py） | 摘要靠"摘要消息"第 0 位传递，被切轮当伪轮 | 压缩函数改为接收上次摘要作输入、产出更新后摘要写入字段；消息头部那条摘要提示由字段内容拼装，不再反向解析 | E、问题 5 | 2026-09-08 | `compress_history` 签名（memory.py:97）改 `(messages, running_summary="")`、返回 `(out, summary)`；`compress_node`（graph.py:438-440 update_state）把 `summary` 一并写入 state |
 

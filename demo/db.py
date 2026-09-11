@@ -51,9 +51,9 @@ def get_checkpointer() -> PostgresSaver:
     **不在 schema.sql 里手写**——避免与框架结构冲突、也避免命名上和业务表混淆。
     需要物理隔离时改用：PostgresSaver.from_conn_string(uri, schema="langgraph")。
     """
-    saver = PostgresSaver.from_conn_string(get_postgres_uri())
+    saver = PostgresSaver.from_conn_string(get_postgres_uri()) #返回的是 LangGraph 的检查点器实例（绑定到那个库
     saver.setup()  # 幂等：首次创建框架表（业务无需手写）
-    return saver
+    return saver   # setup() 是框架（LangGraph）的方法，怎么"知道"要建什么表、结构是什么---表定义是写死在 LangGraph 库源码里的
 
 
 def insert_episodic_memories(episodes: Sequence[dict],
@@ -95,9 +95,13 @@ def insert_episodic_memories(episodes: Sequence[dict],
             vec,
         ))
 
+    # 用与 checkpointer 相同的连接串开一条 PG 连接（上下文管理器，退出自动关闭）
     with psycopg.connect(get_postgres_uri()) as conn:
+        # 注册 pgvector 类型适配器：让 psycopg 能正确收发 vector 列（embedding 字段）。
+        # 不注册则 executemany 不认识 numpy/list 形式的向量，会报类型不支持错误。
         register_vector(conn)
         with conn.cursor() as cur:
+            # 批量插入：一条参数化 SQL + rows 列表，一次写多条 episode（比逐条 INSERT 高效）
             cur.executemany(
                 """
                 INSERT INTO episodic_memory
@@ -106,6 +110,7 @@ def insert_episodic_memories(episodes: Sequence[dict],
                 """,
                 rows,
             )
+            # 显式提交事务（executemany 在上下文管理器内不会自动 commit，需提交才真正落库）
             conn.commit()
 
 
