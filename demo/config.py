@@ -21,8 +21,10 @@ class Settings:
     # 护栏 / 压缩阈值
     MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "12"))   # 图步数硬护栏（recursion_limit）：单次 invoke 节点执行总步数上限，防任意环死循环
     MAX_DISPATCHES = int(os.getenv("MAX_DISPATCHES", "4"))    # 派单次数护栏（C10）：本轮最多派给几个不同专家，超了强制 farewell 收尾
-    MAX_TOKEN_LIMIT = int(os.getenv("MAX_TOKEN_LIMIT", "4000"))  # 上下文压缩触发上限
-    SUMMARY_TRIGGER_RATIO = 0.8   # 达到窗口 80% 开始压最早步骤
+    MAX_TOKEN_LIMIT = int(os.getenv("MAX_TOKEN_LIMIT", "4000"))  # 上下文窗口 token 上限（硬顶基准）
+    SUMMARY_TRIGGER_RATIO = 0.8   # 【已废弃】旧单阈值；仅作兼容保留，新逻辑用下方两档
+    SOFT_TRIGGER_RATIO = 0.6  # 软触发线：窗口用到 60% 即提前温和压缩，留大缓冲（压得少、损失小）
+    HARD_LIMIT_RATIO = 0.8    # 硬顶线：窗口不可超 80%，压完必须回落到硬顶以下（极端时连带单轮兜底）
 
     # RAG
     CHUNK_SIZE = 400

@@ -87,6 +87,7 @@ from memory import compress_history, count_messages_tokens
 # 这正是「无状态实例 + 状态在图里累积」的体现。
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], lambda x, y: x + y]
+    summary: str   # 【D系列】滚动摘要（覆盖式字段，非 reducer）：压缩节点写入，入口压缩时传给 compress_history；不再靠第0条 SystemMessage 伪装
     next: str   # supervisor 写：下一步去哪个子 Agent（"order"/"qa"/"ticket"/"farewell"），默认覆盖
     called_agents: list  # 【C10】本轮已派过的专家（代码级防死循环护栏）；非 reducer 字段，默认覆盖
 
@@ -168,7 +169,6 @@ def supervisor(state: AgentState) -> dict:
     #   + 之前所有轮（框架从 checkpointer load 回来）+ 本轮已产出的专家结论。
     #   这正是官方 langgraph-supervisor 默认行为（output_mode="last_message" 下，
     #   主图历史=不含子 Agent 工具步骤，M2 已保证这点）。
-    #   旧 C7b 的"拼接本轮已产出结论摘要"是临时补丁，C9 用"看完整历史"取代它。
     # 【C10·硬护栏】called_agents 记录本轮已派过的专家；若调度台又要派同一专家、
     #   或派单次数超 MAX_DISPATCHES 上限，直接在代码层强制切到 farewell → answer 收尾。
     #   注意：派单上限用独立的 MAX_DISPATCHES，不与图步数护栏 MAX_ITERATIONS 混用
@@ -419,25 +419,34 @@ def _build_recall_message(hits: List[dict]) -> SystemMessage:
 #    对应讨论的「第2块压缩」：触发时机 = 每次节点处理后，检查 token 压最早步骤。
 # ============================================================
 def compress_node(state: AgentState, config: dict) -> dict:
-    """【生产生效节点】按轮次滚动压缩累积历史 —— **只作用于工作记忆（上下文窗口）**。
+    """【生产生效节点 · 两档触发】滚动压缩累积历史 —— **只作用于工作记忆（上下文窗口）**。
 
     生产要点：
     - State.messages 用 Annotated 累加 reducer，节点若 `return {"messages": 完整列表}`
       会把完整列表「再追加」到白板，导致历史翻倍。所以**不能用普通返回值写回完整列表**。
-    - 正确做法：用 graph.update_state(...) 把整个 messages 字段「整体替换」为压缩结果
-      （update_state 是直接覆盖白板，不走 reducer 累加）。
-    - 触发口径 = **token 计数**（窗口 80%），与 compress_history 共用
-      memory.count_messages_tokens；不用字符数，也不用轮数粗判。
-    - 压缩粒度 = 「轮」（不是消息条数）；产出 [1 条历史摘要] + [最近 N 轮原文]。
+    - 正确做法：用 graph.update_state(...) 把 messages 与 summary 字段「整体替换/覆盖」
+      （update_state 直接覆盖白板，不走 reducer 累加）。
+    - 触发口径 = **token 计数 · 两档**（软触发 60% 提前温和压、硬顶 80% 强制压到硬顶下），
+      与 compress_history 共用 memory.count_messages_tokens；不用字符数，也不用轮数粗判。
+    - 压缩粒度 = 「轮」（不是消息条数）；压缩手段 = 小模型 LLM 摘要（与 LangMem 一致）。
+    - 滚动摘要通过 state.summary 字段承载（覆盖式），由本节点写回；不再伪装成 messages 第0条。
     ⚠️ 关键澄清：本节点**不触发情景记忆落库**。情景记忆由 checkpointer 在图中
        每个节点产出后自动落盘，与这里的 token 阈值无关。
     """
-    trigger = int(Settings.MAX_TOKEN_LIMIT * Settings.SUMMARY_TRIGGER_RATIO)
-    if count_messages_tokens(state["messages"]) <= trigger:
-        return {}  # 未超阈，不压（只压工作记忆/窗口，不涉及落库）
-    compressed = compress_history(state["messages"])
-    # 用 update_state 整体替换白板，绕过累加 reducer（避免重复追加）
-    graph.update_state(config, {"messages": compressed})
+    soft_limit = int(Settings.MAX_TOKEN_LIMIT * Settings.SOFT_TRIGGER_RATIO)
+    if count_messages_tokens(state["messages"]) <= soft_limit:
+        return {}  # 未到软触发线，不压（零成本；只压工作记忆/窗口，不涉及落库）
+    # 目标水位：已冲过硬顶则压到硬顶线以下，否则压到软触发线以下（留更大缓冲）
+    total = count_messages_tokens(state["messages"])
+    hard_limit = int(Settings.MAX_TOKEN_LIMIT * Settings.HARD_LIMIT_RATIO)
+    target_ratio = Settings.HARD_LIMIT_RATIO if total > hard_limit else Settings.SOFT_TRIGGER_RATIO
+    out, summary = compress_history(
+        state["messages"],
+        running_summary=state.get("summary", ""),
+        target_ratio=target_ratio,
+    )
+    # 用 update_state 整体替换白板（messages 整体替换 + summary 覆盖），绕过累加 reducer
+    graph.update_state(config, {"messages": out, "summary": summary})
     return {}  # 节点本身不重复返回，避免 reducer 再追加一次
 
 
@@ -464,7 +473,8 @@ builder.add_node("answer", answer_node)       # 汇总/作答节点：本轮唯�
 
 # 边
 builder.add_edge(START, "recall")                     # 入口 -> 记忆召回（按需注入）
-builder.add_edge("recall", "supervisor")              # 召回后 -> 调度台
+builder.add_edge("recall", "compress")                # 召回后 -> 入口压缩（校准窗口，未超零成本返回）
+builder.add_edge("compress", "supervisor")            # 压缩后 -> 调度台
 builder.add_conditional_edges(                        # 调度台 -> 按 next 分流
     "supervisor",
     route,
@@ -522,7 +532,7 @@ def chat(user_input: str, session_id: str = "default") -> str:
     cfg = {"configurable": {"thread_id": session_id}}
     # 【C10】每轮重置 called_agents，避免跨轮累加误伤"重复派单"判断
     result = graph.invoke(
-        {"messages": [HumanMessage(content=user_input)], "called_agents": []},
+        {"messages": [HumanMessage(content=user_input)], "called_agents": [], "summary": ""},
         config=cfg,
     )
     # 取最后一条 AI 消息作为答复

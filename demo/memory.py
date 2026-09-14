@@ -14,7 +14,7 @@
    - 压缩只改「窗口里的内容」，不是情景记忆的落库触发条件。
    摘要用 SMALL_MODEL（便宜快）：LangChain memory 接受你传入的 llm 实例。
 """
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage, ToolMessage
 
@@ -67,14 +67,20 @@ def split_into_turns(messages: List[BaseMessage]) -> List[List[BaseMessage]]:
 
 
 def _turn_to_text(turn: List[BaseMessage]) -> str:
-    """把一轮对话转成纯文本，方便小模型摘要（保留角色与内容）。"""
+    """把一轮对话转成纯文本，方便小模型摘要。
+
+    只留问答正文，过滤工具类噪声（ToolMessage 是内部实现细节，不应进摘要污染、也省预算）。
+    """
     parts = []
     for m in turn:
+        if isinstance(m, ToolMessage):
+            continue  # 工具返回是内部噪声，不进摘要
         role = ("用户" if isinstance(m, HumanMessage)
                 else "助手" if isinstance(m, AIMessage)
-                else "工具" if isinstance(m, ToolMessage)
                 else "系统")
         content = getattr(m, "content", "") or ""
+        if not content:
+            continue
         parts.append(f"{role}: {content}")
     return "\n".join(parts)
 
@@ -92,51 +98,135 @@ def count_messages_tokens(messages: Sequence[BaseMessage]) -> int:
 
 
 # ============================================================
-# 核心：滚动压缩（按轮次）
+# 核心：滚动压缩（按轮次 · 两档触发 · 增量累积摘要）
 # ============================================================
+# 滚动摘要体量上限（约占窗口一小部分，避免摘要本身撑爆上下文）
+SUMMARY_MAX_CHARS = 600
+
+
 def compress_history(messages: Sequence[BaseMessage],
-                     keep_recent_turns: int = 3) -> List[BaseMessage]:
-    """【第2块压缩 · 按轮次】对超阈值的多轮历史做滚动摘要。
+                     running_summary: str = "",
+                     target_ratio: float = None) -> Tuple[List[BaseMessage], str]:
+    """【第2块压缩 · 按轮次 · 两档触发】对超阈值多轮历史做滚动摘要。
 
-    行为：
-      1. 把 messages 按「轮」切分；
-      2. 保留最近 keep_recent_turns 轮原文（不压）；
-      3. 更早的轮次 → 逐轮用小模型摘要；
-      4. 返回 [SystemMessage(历史摘要)] + 最近 N 轮原文，供图内 update_state 替换白板。
+    行为与主流（LangMem summarize）对齐：
+      1. 按「轮」切分（一轮 = 一条 HumanMessage 起、到下一条 Human 前止）；
+      2. 低于软触发线（窗口 60%）→ 原样返回，不压（摘要沿用旧值）；
+      3. 软触发~硬顶（60%~80%）→ 把最老轮逐轮滚进滚动摘要，直到总量回落到软触发线以下
+         （提前、少量、温和压缩，留大缓冲）；
+      4. 超硬顶（>80%）→ 压到硬顶线以下；若压完保留区仍超硬顶（当前轮本身极大）→ 单轮兜底。
 
-    注意：压缩单位是「轮」，不是「消息条数」。一轮 = 一次 user 输入 + 对应 assistant 回复
-    （子 Agent 只回结论后，一轮就是 Human + AI 结论，不再夹带 ToolMessage）。
-    ⚠️ 本函数**只改工作记忆（窗口内容）**，不写任何数据库：
-       情景记忆落盘由 checkpointer 在每个节点产出后自动完成，与压缩完全解耦。
+    滚动摘要 = 增量累积（旧 running_summary + 新滚入轮），非每次从零重压；
+    窗口里始终 = [最近保留轮原文] + 一条由 state 承载的滚动摘要，不会长期堆几十轮。
+
+    ⚠️ 本函数**只改工作记忆（窗口内容）**，不写任何数据库。
+    返回 (压缩后消息列表, 更新后的滚动摘要)；摘要通过第 2 项传回，由调用方写入 state 字段，
+    不再伪装成 messages 第 0 条的 SystemMessage。
     """
     turns = split_into_turns(messages)
-    # 整段 token 数（统一口径：与 compress_node 共用 count_messages_tokens）
     total = count_messages_tokens(messages)
-    trigger = int(Settings.MAX_TOKEN_LIMIT * Settings.SUMMARY_TRIGGER_RATIO)
+    limit = Settings.MAX_TOKEN_LIMIT
+    soft_limit = int(limit * Settings.SOFT_TRIGGER_RATIO)
+    hard_limit = int(limit * Settings.HARD_LIMIT_RATIO)
 
-    # 轮数本来就少（没超 keep_recent_turns），或总 token 未超阈值 → 不压
-    if len(turns) <= keep_recent_turns or total <= trigger:
-        return messages
+    # 低于软触发线 → 不压（保留区 = 全部，摘要不变）
+    if total <= soft_limit:
+        return list(messages), running_summary
 
-    # 切分：old_turns = 要被压缩的更早轮次；recent_turns = 保留原文的近轮
-    old_turns = turns[:-keep_recent_turns]
-    recent_turns = turns[-keep_recent_turns:]
+    # 目标水位：由调用方指定（软触发档→软触发线；硬顶档→硬顶线）
+    target = int(limit * (target_ratio if target_ratio is not None else Settings.HARD_LIMIT_RATIO))
 
-    summary_parts = []
+    # 从最新向最旧逐轮累计 token，预算内整轮保留原文（至少保留最新一轮），超出的轮滚进摘要
+    recent_turns: List[List[BaseMessage]] = []
+    budget = 0
+    for turn in reversed(turns):
+        t = count_messages_tokens(turn)
+        if budget + t <= target or not recent_turns:  # 至少一个最新轮，避免返回空消息
+            recent_turns.insert(0, turn)
+            budget += t
+        else:
+            break
+    old_turns = turns[: len(turns) - len(recent_turns)]
+
+    # 超出的轮滚进增量累积滚动摘要
+    summary = running_summary
     for turn in old_turns:
-        turn_text = _turn_to_text(turn)
-        # 逐轮摘要（可累加之前摘要，形成递进压缩）
-        summary = summarize_with_small_model(
-            (summary_parts[-1] + "\n" if summary_parts else "") + turn_text,
-            max_chars=200,
-        )
-        summary_parts.append(summary)
+        summary = _roll_into_summary(summary, turn)
 
-    # 组装返回：[一条历史摘要 SystemMessage] + 最近 N 轮原文（摊平回消息列表）
-    full_summary = "\n".join(f"[第{i}轮] {s}" for i, s in enumerate(summary_parts))
+    # 单轮兜底：压完保留区仍超硬顶（当前轮本身极大）
+    recent_tokens = count_messages_tokens([m for turn in recent_turns for m in turn])
+    guard = 0
+    while recent_tokens > hard_limit and guard < 10:
+        guard += 1
+        changed = False
+        # ① 折叠最新一轮（进行中、可能多条子 Agent 结论）→ 合并成 1 条
+        if recent_turns:
+            collapsed = _collapse_turn(recent_turns[-1])
+            if collapsed is not recent_turns[-1]:
+                recent_turns[-1] = collapsed
+                changed = True
+        recent_tokens = count_messages_tokens([m for turn in recent_turns for m in turn])
+        if recent_tokens <= hard_limit:
+            break
+        # ③ 把更前一轮（已规范成 [H,A] 的历史轮）整轮滚进摘要，向前扩展边界
+        if len(recent_turns) > 1:
+            summary = _roll_into_summary(summary, recent_turns.pop(0))
+            changed = True
+        recent_tokens = count_messages_tokens([m for turn in recent_turns for m in turn])
+        if recent_tokens <= hard_limit:
+            break
+        if not changed:
+            # ② 只剩最新一轮且仍超 → 对溢出部分硬截断（删溢出 token，非删完整结论）
+            recent_turns[-1] = _truncate_turn(recent_turns[-1], hard_limit)
+            recent_tokens = count_messages_tokens([m for turn in recent_turns for m in turn])
+            break
+
+    # 组装返回：只放最近保留轮原文；摘要通过第 2 项传出
     out: List[BaseMessage] = []
-    if full_summary:
-        out.append(SystemMessage(content=f"[历史摘要]\n{full_summary}"))
     for turn in recent_turns:
         out.extend(turn)
+    return out, summary
+
+
+def _roll_into_summary(summary: str, turn: List[BaseMessage]) -> str:
+    """把一轮整轮滚进滚动摘要（增量累积：旧摘要 + 新轮）。"""
+    turn_text = _turn_to_text(turn)
+    text = (summary + "\n" + turn_text) if summary else turn_text
+    return summarize_with_small_model(text, max_chars=SUMMARY_MAX_CHARS)
+
+
+def _collapse_turn(turn: List[BaseMessage]) -> List[BaseMessage]:
+    """折叠进行中轮：把轮内多条子 Agent 结论用 LLM 合并成 1 条 AIMessage（保留信息，非丢弃）。
+
+    仅当轮内有多条 AI 结论时生效；单条 AI（已规范的一问一答）原样返回。
+    """
+    human = next((m for m in turn if isinstance(m, HumanMessage)), None)
+    ai_msgs = [m for m in turn if isinstance(m, AIMessage)]
+    if human is None or len(ai_msgs) <= 1:
+        return turn
+    merged_text = _turn_to_text(ai_msgs)
+    merged = summarize_with_small_model(merged_text, max_chars=SUMMARY_MAX_CHARS)
+    return [human, AIMessage(content=merged)]
+
+
+def _truncate_turn(turn: List[BaseMessage], hard_limit: int) -> List[BaseMessage]:
+    """极端兜底：把一轮内超出硬顶的部分硬截断（删溢出，非删完整结论）。"""
+    out: List[BaseMessage] = []
+    budget = 0
+    for m in turn:
+        t = count_messages_tokens([m])
+        if budget + t <= hard_limit:
+            out.append(m)
+            budget += t
+        else:
+            room = max(0, hard_limit - budget)
+            if room <= 0:
+                break
+            allowed_chars = room * 2  # 粗估 1 token≈2 字符
+            content = getattr(m, "content", "") or ""
+            if isinstance(m, (HumanMessage, AIMessage)) and content:
+                out.append(type(m)(content=content[:allowed_chars] + "…[已截断]"))
+                budget += room
+            # 其他类型消息（如 SystemMessage）超预算则丢弃
+            break
     return out

@@ -439,10 +439,18 @@ CREATE TABLE sessions_warm PARTITION OF sessions
 
 ---
 
+### Q28: 为什么压缩分软触发 / 硬顶两档？增量滚动摘要是什么？
+
+**A28**: 单阈值（只在 80% 才压）有两个毛病：① 0~80% 从不压，摘要一直空着，到 80% 要一次滚很多轮、损失大；② 突发超长轮会瞬间从 60% 飙到 100%+，中间没缓冲直接爆窗。两档对应操作系统「低水位 / 高水位标记」：
+- **软触发（窗口 60%）**：提前温和介入，把最老轮逐轮滚进「滚动摘要」（LLM 摘要），每次只滚一小撮、留 40% 大缓冲；摘要是**增量累积**的（旧摘要+新轮一起压），不会某天突然从零压一大坨。
+- **硬顶（窗口 80%）**：不可逾越的红线，压完必须回落到 80% 以下；只有冲过硬顶、压完保留区仍超时，才连带「单轮兜底」（折叠当前轮内多条结论 / 溢出硬截断 / 更前轮整轮滚摘要）。
+- 两档**压缩方法都是小模型 LLM 摘要**，区别只在触发早晚与目标水位（60% 留缓冲 vs 80% 压更狠），与 LangMem 的 early/soft trigger 一致。
+- **滚动摘要作为独立字段**（state.summary）承载，不再伪装成 messages 第 0 条的 SystemMessage，可单独预算、单独传递。
+
 ## 📁 关联代码参考
 
 生产级实现见 `agent/demo/`（LangGraph 方案 B）：
-- `memory.py`：`compress_history`（滚动压缩，token 计数触发）+ `summarize_with_small_model`（小模型摘要）
+- `memory.py`：`compress_history(messages, running_summary, target_ratio)` 返回 `(out, summary)`（两档触发 · 增量累积滚动摘要 · 单轮兜底）+ `summarize_with_small_model`（小模型摘要）+ `_collapse_turn`/`_truncate_turn`（单轮兜底）
 - `tools.py`：工具返回压缩（`_format_orders` 裁剪、`rag_search` 过长摘要）+ 备用数据源降级
 - `vector_store.py`：RAG 切分/embed/检索（问题 vs 片段）+ 上传即入库 + 删文件联动清向量
 - `graph.py`：Supervisor 多 Agent + `recursion_limit` 步数护栏 + 压缩节点示意
