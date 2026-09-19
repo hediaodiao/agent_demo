@@ -40,7 +40,7 @@
   作用域：单 thread_id（同一会话）。⚠️ 默认**不跨会话**——这是豆包等主流形态；
           跨会话属于下面语义记忆（opt-in）的活，不要混为一谈。
   何时写/读：**每轮** answer_node 产出最终回复后，后台线程蒸馏写库（不阻塞回复）；
-          读取由 `recall_node` 在会话内**按需触发**（实体/语义触发），不每轮无脑查。
+          读取由主 Agent 的 `search_memory` 工具在会话内**按需 agentic 触发**（实体/语义），不每轮无脑查。
           与压缩完全解耦。
   ⚠️ 关于 checkpointer：LangGraph 的 checkpointer（`checkpoints` 表，每个节点存
      一份全量 state 快照）是**框架机制**，用于断点恢复 / 无状态化，
@@ -65,12 +65,15 @@
 三层职责：工作记忆=窗口(易失，checkpointer 供续聊)，情景记忆=蒸馏结构化片段落库(单会话、按需召回)，
           语义记忆=跨会话画像(opt-in，未实现)。不使用内存版介质。
 """
-from typing import Annotated, Literal, TypedDict, Sequence, List
+from typing import Annotated, TypedDict, Sequence, List
 # 注：主上下文不再处理 ToolMessage（子 Agent 只回结论，见 _run_subagent），故不导入
 import threading
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.types import Command
 from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import tool, InjectedState
 from db import (get_checkpointer, insert_episodic_memories,
               search_episodic_by_vector, search_episodic_by_entities)
 
@@ -88,17 +91,16 @@ from memory import compress_history, count_messages_tokens
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], lambda x, y: x + y]
     summary: str   # 【D系列】滚动摘要（覆盖式字段，非 reducer）：压缩节点写入，入口压缩时传给 compress_history；不再靠第0条 SystemMessage 伪装
-    next: str   # supervisor 写：下一步去哪个子 Agent（"order"/"qa"/"ticket"/"farewell"），默认覆盖
-    called_agents: list  # 【C10】本轮已派过的专家（代码级防死循环护栏）；非 reducer 字段，默认覆盖
+    thread_id: str  # 会话主键（= thread_id）：供主 Agent 的记忆检索工具按会话隔离读取（十五 #34）
+    delegated_request: str  # 十六 #41 补全：主 Agent 分解后委派给子 Agent 的具体子任务（handoff 工具经 Command.update 写入，_run_subagent 读取作为子 Agent 上下文）
 
 
-# 【C8·结构化路由】调度台的结构化输出枚举。
-# 取代旧实现里 model.invoke 后做 `if "order" in decision` 子串匹配
-# （非主流、易误判：用户原话里出现"订单"二字却可能在问别的）。
-# 结构化输出让 LLM 直接返回枚举，路由 100% 确定、可校验、好测试，
-# 是 langgraph-supervisor 等主流框架的标准做法。
-class RoutingDecision(TypedDict):
-    next: Literal["order", "qa", "ticket", "farewell"]
+# 主 Agent 子图的状态：消息用标准 add_messages reducer 累加，并携带 thread_id。
+# thread_id 不交给 LLM，仅用于 LangGraph 通过 InjectedState 注入 search_memory 工具，
+# 实现「按会话隔离检索情景记忆」而不污染模型可见入参（十五 #34）。
+class SupervisorState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    thread_id: str
 
 
 # ============================================================
@@ -124,27 +126,11 @@ ticket_agent = _make_subagent(TICKET_TOOLS, "工单")
 
 
 # ============================================================
-# 3. Supervisor 节点（手写决策：分流到哪个子 Agent）
-#    对应讨论：多 Agent 的「主 Agent 调度」，这里是核心路由逻辑。
+# 3. Supervisor = 真正的主 Agent（create_react_agent + 工具）
+#    十五 #31/#35：supervisor 不再是纯分类器，而是会调工具的「主 Agent」；
+#    通过 handoff 工具（transfer_to_*）委派子 Agent，通过 search_memory 工具
+#    按需召回情景记忆——派单与记忆召回都由 LLM 自决（agentic），而非写死枚举。
 # ============================================================
-ROUTING_PROMPT = SystemMessage(content="""
-你是客服调度台。请依据【对话里最新一条用户消息】判断下一步去向，
-并通过结构化字段 `next` 返回唯一取值（不要输出其它内容）：
-- 订单/物流/发货/查订单 -> order
-- 退货政策/发票/会员/知识库 -> qa
-- 投诉/建工单/提交工单 -> ticket
-- 结束语且用户无新诉求（纯谢谢/再见/明白了，没有再问问题）-> farewell
-- 闲聊/问候且无业务意图 -> farewell
-- 任务已完成且用户没有新诉求 -> farewell
-注意：
-1. 如果用户最新消息里除了致谢还包含了新的问题或诉求（例如"谢谢，另外我想问…"），必须按新意图派给 order/qa/ticket，不要结束。
-2. 只有「确认/致谢/闲聊」且确实没有新问题时，才返回 farewell。
-3. 【辅助·防死循环】如果你在历史中已看到某专家给出的结论覆盖了用户问题，
-   就不要再把同一个诉求重复派给同一个专家；确无新诉求就返回 farewell
-   （交给 answer 节点整合收尾）。代码层另有硬护栏兜底，此处仅为辅助提示。
-""")
-
-
 def _last_human_index(messages) -> int:
     """返回最后一条 HumanMessage 的下标；没有则返回 -1。"""
     for i in range(len(messages) - 1, -1, -1):
@@ -154,39 +140,124 @@ def _last_human_index(messages) -> int:
 
 
 def _conclusions_since_last_human(messages) -> list:
-    """取「最后一条 HumanMessage 之后」的 AI 结论 = 本轮各子 Agent 的产物。
+    """取「最后一条 HumanMessage 之后」、由子 Agent 写回的结论（带 metadata 标记）。
 
-    这些是**中间产物**：多专家时会被 answer_node 整合成一条最终回复；
-    单专家时它本身就是最终回复（直接透传）。它们都不直接落 episodic_memory。
+    只收带 type=subagent_conclusion 的结论，排除主 Agent 自身的推理/工具调用噪声。
+    单专家时它本身就是最终回复（直接透传）；多专家时由 answer_node 整合成一条。
     """
     idx = _last_human_index(messages)
     tail = messages[idx + 1:] if idx >= 0 else messages
-    return [m for m in tail if isinstance(m, AIMessage) and (m.content or "")]
+    return [m for m in tail
+            if isinstance(m, AIMessage) and (m.content or "")
+            and (m.metadata or {}).get("type") == "subagent_conclusion"]
 
 
-def supervisor(state: AgentState) -> dict:
-    # 【C9·回归标准】调度台看「完整主图历史」state["messages"]：含本轮用户提问
-    #   + 之前所有轮（框架从 checkpointer load 回来）+ 本轮已产出的专家结论。
-    #   这正是官方 langgraph-supervisor 默认行为（output_mode="last_message" 下，
-    #   主图历史=不含子 Agent 工具步骤，M2 已保证这点）。
-    # 【C10·硬护栏】called_agents 记录本轮已派过的专家；若调度台又要派同一专家、
-    #   或派单次数超 MAX_DISPATCHES 上限，直接在代码层强制切到 farewell → answer 收尾。
-    #   注意：派单上限用独立的 MAX_DISPATCHES，不与图步数护栏 MAX_ITERATIONS 混用
-    #   （后者数"节点执行步数"，本项数"不同专家派单次数"，语义不同）。
-    called_agents = list(state.get("called_agents", []))
+# ---- 十五 #33：实体抽取从正则换 LLM（与蒸馏侧实体口径一致）----
+class EntityExtract(TypedDict):
+    entities: dict  # 如 {"order_id":"A","ticket_id":"5521"}，无则 {}
 
-    # 【C8·结构化输出】让 LLM 直接返回枚举 RoutingDecision，路由 100% 确定
-    model = get_llm("big").with_structured_output(RoutingDecision)
-    decision: RoutingDecision = model.invoke([ROUTING_PROMPT] + list(state["messages"]))
-    next_agent = decision.get("next", "farewell")
 
-    # C10 硬护栏：重复派同一专家 / 派单次数超 MAX_DISPATCHES → 强制收尾（prompt 规则仅辅助）
-    if next_agent in called_agents or len(called_agents) >= Settings.MAX_DISPATCHES:
-        next_agent = "farewell"
+def extract_entities_llm(text: str) -> dict:
+    """用大模型从用户语句抽取可检索实体（取代原正则 _extract_entities_from_text）。"""
+    model = get_llm("small").with_structured_output(EntityExtract)
+    try:
+        res = model.invoke([
+            SystemMessage(content="从用户语句中抽取订单号/工单号等可检索实体，"
+                                  "返回 entities dict；没有则返回 {}。只输出结构化结果。"),
+            HumanMessage(content=text),
+        ])
+        return (res or {}).get("entities") or {}
+    except Exception:
+        return {}
 
-    if next_agent != "farewell":
-        return {"next": next_agent, "called_agents": called_agents + [next_agent]}
-    return {"next": next_agent}
+
+# ---- 十五 #34：记忆检索工具（agentic 召回，取代 recall_node 固定闸门）----
+def _search_memory_impl(thread_id: str, query: str) -> str:
+    """实体（LLM 抽取）+ 语义（向量）混合召回；由主 Agent 决定何时调用。"""
+    emb = Embedder()
+    # ① 实体召回（LLM 抽取实体，精确匹配，直接返回不卡阈值）
+    ents = extract_entities_llm(query)
+    hits = search_episodic_by_entities(thread_id, ents) if ents else []
+    if hits:
+        return _build_recall_message(hits).content
+    # ② 语义召回（向量相似度，需超阈值）
+    try:
+        qv = emb.embed(query)
+        hits = search_episodic_by_vector(thread_id, qv)
+    except Exception:
+        hits = []
+    if hits and (hits[0].get("similarity") or 0) >= Settings.SEMANTIC_TRIGGER_THRESHOLD:
+        return _build_recall_message(hits).content
+    return "（无相关历史记忆）"
+
+
+# search_memory 作为工具被主 Agent 调用；thread_id 由 LangGraph 通过 InjectedState
+# 从 SupervisorState 注入，LLM 不可见该参数（只暴露 query）。
+@tool
+def search_memory(query: str, thread_id: Annotated[str, InjectedState("thread_id")]) -> str:
+    """检索当前会话的历史情景记忆，找回被压缩掉的精确细节（订单号/工单号/过往承诺等）。
+    当用户问题涉及"之前/上次/刚才/那个"或需要历史上下文时调用。"""
+    return _search_memory_impl(thread_id, query)
+
+
+# ---- 十五 #35：handoff 工具（把子 Agent 暴露为主 Agent 可调用工具）----
+def _make_handoff_tool(node: str, label: str, scenarios: str):
+    """生成一个 handoff 工具：被调用即把控制权转交到对应子 Agent 节点（跨图 Command）。
+
+    十六 #41 补全「主 Agent 委派指令」：工具新增 request 参数，由 supervisor LLM 填入
+    本次分解出的具体子任务（含必要实体），经 Command.update 写入父图状态 delegated_request，
+    供 _run_subagent 作为子 Agent 的独立上下文——而非退化成「最新一条用户来信」。
+    scenarios 为该专家负责的场景说明，写入工具 description，由 LLM 按需选择
+    （替代原 SUPERVISOR_PROMPT 里的路由枚举，避免 prompt 随 skill 增多而膨胀）。
+    """
+    @tool(f"transfer_to_{node}",
+          description=f"将【一个具体子任务】委派给{label}专家子 Agent 处理。"
+                      f"{label}专家负责的场景：{scenarios}。"
+                      f"request 必须写成分解后的明确指令（含订单号/工单号等必要实体），"
+                      f"不要照抄用户原话。")
+    def _handoff(request: str) -> Command:
+        return Command(goto=node, graph=Command.PARENT,
+                       update={"delegated_request": request})
+    return _handoff
+
+
+transfer_to_order = _make_handoff_tool("order", "订单",
+                                       "订单查询、物流/发货状态、配送改派")
+transfer_to_qa = _make_handoff_tool("qa", "知识库问答",
+                                    "退货政策、发票、会员权益、产品知识库问答")
+transfer_to_ticket = _make_handoff_tool("ticket", "工单",
+                                        "投诉受理、建工单、售后问题升级处理")
+
+
+@tool
+def finish() -> Command:
+    """当已收集到足够信息可以回答用户，或用户仅致谢/闲聊无业务意图时调用，进入最终回复整合。"""
+    return Command(goto="answer", graph=Command.PARENT)
+
+
+SUPERVISOR_PROMPT = SystemMessage(content="""
+你是客服总台（主 Agent），负责协调多个专家子 Agent 并给出最终回复。
+- 若用户问题需要历史上下文（涉及"之前/上次/刚才/那个"，或需要过往订单/工单信息），
+  先调用 search_memory 检索相关记忆。
+- 需要某位专家处理时，调用对应的 transfer_to_* 工具委派（各工具的 description 已说明其负责场景，
+  按用户诉求匹配对应专家即可，无需记忆固定映射）。
+- 调用 transfer_to_* 时，request 参数务必写成【分解后的具体子任务】——明确要查什么、
+  并带上订单号/工单号等必要实体；不要整句照抄用户原话。同一用户诉求含多个子任务时，
+  分别委派、各传各自的具体指令（例如"查订单A物流"与"查工单B进度"各传各的）。
+- 当你已获得足够信息（或无需专家、纯致谢闲聊）可以回答用户时，调用 finish 工具结束本轮。
+- 不要自己编造订单/工单数据，数据交给对应专家的工具去查。
+- 同一诉求不要重复委派给已处理过的专家；确无新诉求就调用 finish。
+""")
+
+
+# 主 Agent：持 handoff 工具 + 记忆检索工具，派单与记忆召回皆由 LLM 自决（agentic）。
+# 用 SupervisorState 作 state_schema，使 thread_id 进入子图状态，供 InjectedState 注入。
+supervisor_agent = create_react_agent(
+    get_llm("big"),
+    [transfer_to_order, transfer_to_qa, transfer_to_ticket, search_memory, finish],
+    prompt=SUPERVISOR_PROMPT,
+    state_schema=SupervisorState,
+)
 
 
 # ============================================================
@@ -207,25 +278,42 @@ def _extract_conclusion(new_msgs) -> AIMessage:
     return AIMessage(content=getattr(tail, "content", "") or "（子 Agent 未产出结论）")
 
 
-def _run_subagent(agent, state: AgentState) -> dict:
-    """调用子 Agent，并【只把结论】写回主 state。
+# ============================================================
+# 4.1 子 Agent 节点（十六 #41/#42/#43：独立上下文）
+#    子 Agent 只接收「当前用户最新问题」作为任务输入，不看全量主上下文，
+#    实现上下文隔离、省 token；且只把结论写回主 state（带 metadata 标记）。
+# ============================================================
+def _scope_for_subagent(state: AgentState, agent_name: str) -> list:
+    """十六 #41：构造子 Agent 的「独立上下文」。
 
-    生产要点（标准「Agent 循环超窗」第①块：工具结果只留结论）：
-    - 子 Agent 内部的 ReAct 循环（AIMessage(tool_calls) / ToolMessage）是过程噪声，
-      不回传主上下文——主上下文只收最后一条 AI 结论。
-    - 这样落进情景记忆(checkpointer)的就是干净的 user+AI 轮，而不是工具循环全量；
-      既省 token，也避免历史被观察结果撑爆。
-    - 子 Agent 已无状态（见 _make_subagent），不传 thread_id，不会跨会话串味。
+    优先级：① 主 Agent 分解后写入的委派指令 delegated_request（具体子任务，含必要实体）；
+            ② 退化为最新一条用户消息（兜底，避免委派指令缺失时子 Agent 无输入）。
+    不再把整段主上下文丢给子 Agent——隔离 + 省 token + 避免多专家互相污染。
     """
-    # 取本会话历史（无状态化：从主上下文取，子 Agent 自身不持有任何记忆）
-    result = agent.invoke({"messages": state["messages"]})
-    new_msgs = result["messages"][len(state["messages"]):]
-    return {"messages": [_extract_conclusion(new_msgs)]}
+    req = (state.get("delegated_request") or "").strip()
+    if req:
+        return [HumanMessage(content=req)]
+    msgs = list(state["messages"])
+    idx = _last_human_index(msgs)
+    if idx < 0:
+        return []
+    return [msgs[idx]]
 
 
-def order_node(state):  return _run_subagent(order_agent, state)
-def qa_node(state):     return _run_subagent(qa_agent, state)
-def ticket_node(state): return _run_subagent(ticket_agent, state)
+def _run_subagent(agent, state: AgentState, agent_name: str = "") -> dict:
+    """十六 #41/#42/#43：只喂「独立上下文」给子 Agent，且只把结论写回主 state。
+    结论带 metadata 标记，便于 answer_node 精准收集（不被主 Agent 推理噪声干扰）。"""
+    scoped = _scope_for_subagent(state, agent_name)
+    result = agent.invoke({"messages": scoped})
+    new_msgs = result["messages"][len(scoped):]
+    conclusion = _extract_conclusion(new_msgs)
+    conclusion.metadata = {**(conclusion.metadata or {}), "type": "subagent_conclusion"}
+    return {"messages": [conclusion]}
+
+
+def order_node(state):  return _run_subagent(order_agent, state, "order")
+def qa_node(state):     return _run_subagent(qa_agent, state, "qa")
+def ticket_node(state): return _run_subagent(ticket_agent, state, "ticket")
 
 
 # ============================================================
@@ -346,65 +434,15 @@ def answer_node(state: AgentState, config: dict) -> dict:
 
 
 # ============================================================
-# 4.3 记忆召回节点（C13）：会话内按需触发，不每轮无脑查
-#
-#   触发条件（不跨会话 → 无"开场预热预注入"）：
-#     ① 实体触发：用户提到订单号/工单号且 entities 命中 → 精确召回；
-#     ② 语义触发：用户说"之前/那个"等指代词且相似度 > 阈值 → 向量召回；
-#     ③ 不触发（闲聊/无关）：返回 {} 不注入，只用 checkpointer 工作记忆。
-#   命中则把 top-K 蒸馏 episode 拼成一条 SystemMessage 注入上下文。
 # ============================================================
-_REFERENCE_WORDS = ("之前", "上次", "刚才", "那个", "之前说的", "刚才说的", "后来")
-_ENTITY_PATTERNS = [
-    (r"订单\s*#?\s*([A-Za-z0-9\-]+)", "order_id"),
-    (r"工单\s*#?\s*([A-Za-z0-9\-]+)", "ticket_id"),
-    (r"#\s*([0-9]+)", "ticket_id"),
-]
-
-
-def _extract_entities_from_text(text: str) -> dict:
-    """轻量正则抽实体（演示用；生产可换 LLM 抽取）。"""
-    import re
-    found = {}
-    for pat, key in _ENTITY_PATTERNS:
-        m = re.search(pat, text)
-        if m:
-            found[key] = m.group(1)
-    return found
-
-
-def recall_node(state: AgentState, config: dict) -> dict:
-    """会话内按需召回同会话情景记忆，补回被压缩掉的精确细节。
-
-    LangGraph 节点可接收 (state, config)；thread_id 从 config 取。
-    触发条件（不跨会话 → 无"开场预热预注入"）：
-      ① 实体触发：用户提到订单号/工单号且 entities 命中 → 精确召回；
-      ② 语义触发：用户说"之前/那个"等指代词且相似度 > 阈值 → 向量召回；
-      ③ 不触发（闲聊/无关）：返回 {} 不注入，只用 checkpointer 工作记忆。
-    """
-    msgs = list(state["messages"])
-    idx = _last_human_index(msgs)
-    if idx < 0:
-        return {}
-    text = (msgs[idx].content or "")
-    thread_id = (config or {}).get("configurable", {}).get("thread_id", "default")
-
-    emb = Embedder()
-    # ① 实体触发
-    ents = _extract_entities_from_text(text)
-    if ents:
-        hits = search_episodic_by_entities(thread_id, ents)
-        if hits:
-            return {"messages": [_build_recall_message(hits)]}
-    # ② 语义触发：有指代词且相似度超阈值
-    if any(w in text for w in _REFERENCE_WORDS):
-        qv = emb.embed(text)
-        hits = search_episodic_by_vector(thread_id, qv)
-        if hits and (hits[0].get("similarity") or 0) >= Settings.SEMANTIC_TRIGGER_THRESHOLD:
-            return {"messages": [_build_recall_message(hits)]}
-    return {}
-
-
+# 4.3 记忆召回（十五 #32/#34）：不再有入口固定闸门节点
+#
+#   原 recall_node（实体/指代词硬触发）已移除；记忆召回改为「agentic」：
+#   由主 Agent 在推理时按需调用 search_memory 工具（见第 3 节），
+#   LLM 自己决定要不要查、查什么——避免"没说指代词但指代旧上下文"时漏召。
+#   召回实现（实体 LLM 抽取 + 向量语义）封装在 _search_memory_impl / search_memory 工具中，
+#   复用下方 _build_recall_message 拼装注入内容。
+# ============================================================
 def _build_recall_message(hits: List[dict]) -> SystemMessage:
     lines = []
     for h in hits:
@@ -451,11 +489,10 @@ def compress_node(state: AgentState, config: dict) -> dict:
 
 
 # ============================================================
-# 6. 条件路由函数（conditional_edges 用）：根据 supervisor 写的 next 决定走向
+# 6. 路由说明（十五 #31/#36）
+#    主 Agent（supervisor）通过 handoff/finish 工具返回 Command(goto=...)，
+#    父图据此跳转；无 Command 时走下方默认边到 answer。无需旧的 route 枚举分发。
 # ============================================================
-def route(state: AgentState) -> str:
-    return state.get("next", "__end__")
-
 
 # ============================================================
 # 7. 画图（StateGraph）：把节点和边连起来
@@ -463,8 +500,7 @@ def route(state: AgentState) -> str:
 builder = StateGraph(AgentState)
 
 # 加节点
-builder.add_node("recall", recall_node)               # C13：会话内按需召回情景记忆
-builder.add_node("supervisor", supervisor)
+builder.add_node("supervisor", supervisor_agent)   # 主 Agent 子图（持有对话 + handoff/记忆工具）
 builder.add_node("order", order_node)
 builder.add_node("qa", qa_node)
 builder.add_node("ticket", ticket_node)
@@ -472,21 +508,16 @@ builder.add_node("compress", compress_node)   # 压缩节点（子Agent跑完后
 builder.add_node("answer", answer_node)       # 汇总/作答节点：本轮唯一最终回复出口
 
 # 边
-builder.add_edge(START, "recall")                     # 入口 -> 记忆召回（按需注入）
-builder.add_edge("recall", "compress")                # 召回后 -> 入口压缩（校准窗口，未超零成本返回）
-builder.add_edge("compress", "supervisor")            # 压缩后 -> 调度台
-builder.add_conditional_edges(                        # 调度台 -> 按 next 分流
-    "supervisor",
-    route,
-    {"order": "order", "qa": "qa", "ticket": "ticket",
-     "farewell": "answer", "__end__": END},
-)
-# 子 Agent 干完 -> 压缩 -> 回到调度台（可多轮：用户有多个诉求会再次分流）
+builder.add_edge(START, "compress")                   # 入口 -> 压缩（校准窗口，未超零成本返回）
+builder.add_edge("compress", "supervisor")           # 压缩后 -> 主 Agent
+# 主 Agent 调用 handoff/finish 工具 → Command(goto) 跳转对应节点；
+# 未返回 Command（正常结束）则走默认边到 answer
+builder.add_edge("supervisor", "answer")
+# 子 Agent 干完 -> 压缩 -> 回到主 Agent（可多轮：用户有多个诉求会再次委派）
 builder.add_edge("order", "compress")
 builder.add_edge("qa", "compress")
 builder.add_edge("ticket", "compress")
-builder.add_edge("compress", "supervisor")            # 压缩后回到调度台，形成循环
-# 调度台判定"本轮任务已完成" -> answer 整合出最终回复 -> 结束
+builder.add_edge("compress", "supervisor")            # 压缩后回到主 Agent，形成循环
 builder.add_edge("answer", END)
 
 # 编译（recursion_limit = 硬护栏：步数封顶，防无限循环）
@@ -494,8 +525,8 @@ builder.add_edge("answer", END)
 #   - 保证「下一轮接着聊 / 进程重启不丢 / 任意实例可恢复」（无状态化）；
 #   - 落盘由框架在每个节点产出后自动完成，与 compress_node 的 token 阈值无关。
 # 注：语义记忆（跨会话用户画像）是 opt-in，标准里非默认，本 demo 不接。
-# 注：情景记忆（蒸馏结构化片段）由 episodic_memory 表承担，recall_node 按需召回，
-#     与 checkpointer 是两张独立表、独立用途（详见顶部三层记忆说明）。
+# 注：情景记忆（蒸馏结构化片段）由 episodic_memory 表承担，主 Agent 的 search_memory
+#     工具按需 agentic 召回，与 checkpointer 是两张独立表、独立用途（详见顶部三层记忆说明）。
 graph = builder.compile(checkpointer=get_checkpointer(),
                         recursion_limit=Settings.MAX_ITERATIONS)
 
@@ -511,9 +542,9 @@ def chat(user_input: str, session_id: str = "default") -> str:
          = **短期记忆（续聊）恢复**，不是情景记忆召回；若历史已超窗，
          取回的已是 [历史摘要] + [最近 k 轮]；未超窗时 load 回的是原始逐轮、无摘要
       2. 把本轮 HumanMessage 追加进去（即「取回的短期记忆 + 本轮」）；
-      3. 图内循环：recall_node(按需召回情景记忆) → supervisor → 子Agent(只回结论)
-         → compress_node(超阈则压)；多个诉求会连续分流到多个子 Agent，
-         直到调度台判定本轮已完成；
+      3. 图内循环：compress(校准窗口) → 主 Agent(按需调 search_memory 召回记忆、
+         调 transfer_to_* 委派子 Agent) → 子 Agent(只回结论) → compress → 主 Agent…
+         直到主 Agent 调 finish 结束本轮；
       4. answer_node 产出**本轮唯一最终回复**（单专家透传 / 多专家整合 /
          纯客套走模板收尾语），并启后台线程异步蒸馏成结构化情景记忆写入 episodic_memory
          （全量原文不再落库，蒸馏失败不影响本轮返回）；
@@ -521,18 +552,19 @@ def chat(user_input: str, session_id: str = "default") -> str:
 
     情景记忆（第 2 层）的「写 & 读」与本过程的关系：
       - 写：第 4 步后台线程蒸馏写库（每轮一次，异步）；
-      - 读：第 3 步开场 recall_node 按需召回——用户提订单/工单号或说"之前/那个"时，
-        把同会话相关 episode 注入上下文，补回被压缩掉的精确细节；平时不查。
+      - 读：第 3 步由主 Agent 的 search_memory 工具**按需 agentic 召回**（取代原 recall_node
+        固定闸门）——用户提订单/工单号或说"之前/那个"时，LLM 自决调用 search_memory 把同会话
+        相关 episode 注入上下文，补回被压缩掉的精确细节；平时不查。
       ⚠️ 不要把「第 1 步 checkpointer 恢复」和「第 3 步情景记忆召回」混为一谈：
         前者是短期记忆（续聊连贯性），后者是蒸馏结构化片段（找回精确细节），两张表、两套用途。
 
     ⚠️ 无状态 ≠ 模型只看本轮：模型看到的是「历史 + 本轮」，
        只是这份历史不在进程内存里，而在 PostgreSQL 中按 thread_id 存着。
     """
-    cfg = {"configurable": {"thread_id": session_id}}
-    # 【C10】每轮重置 called_agents，避免跨轮累加误伤"重复派单"判断
+    cfg = {"configurable": {"thread_id": session_id}, "recursion_limit": Settings.MAX_ITERATIONS}
     result = graph.invoke(
-        {"messages": [HumanMessage(content=user_input)], "called_agents": [], "summary": ""},
+        {"messages": [HumanMessage(content=user_input)],
+         "thread_id": session_id, "summary": "", "delegated_request": ""},
         config=cfg,
     )
     # 取最后一条 AI 消息作为答复

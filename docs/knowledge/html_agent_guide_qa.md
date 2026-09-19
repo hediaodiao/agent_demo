@@ -1,4 +1,4 @@
-# 《AI Agent 面试速记》HTML 追问答疑总结
+# 《AI Agent 速记》HTML 追问答疑总结
 
 > 整理自对 `detection_search/docs/ai_agent_career_guide(2).html` 中面试题的追问与澄清。
 > 定位：把速记版 HTML 里被"压缩省略"的地方展开、纠偏，供面试复习用。

@@ -320,3 +320,123 @@ CREATE INDEX IF NOT EXISTS idx_episodic_embed ON episodic_memory
 | #8 | 状态结构（graph.py） | 无摘要字段 | 状态新增"滚动摘要"文本字段 | E、问题 5 | 2026-09-08 | `AgentState`（graph.py:88-91）新增 `summary: str`——覆盖式字段（不挂累加 reducer，否则会被翻倍） |
 | #9 | 压缩函数签名与写回（memory.py + graph.py） | 摘要靠"摘要消息"第 0 位传递，被切轮当伪轮 | 压缩函数改为接收上次摘要作输入、产出更新后摘要写入字段；消息头部那条摘要提示由字段内容拼装，不再反向解析 | E、问题 5 | 2026-09-08 | `compress_history` 签名（memory.py:97）改 `(messages, running_summary="")`、返回 `(out, summary)`；`compress_node`（graph.py:438-440 update_state）把 `summary` 一并写入 state |
 
+---
+
+## 十五、第四轮：主 agent 化 + 召回侧实体 LLM 化（2026-09-16 提出，2026-09-18 执行完成）
+
+> **起因**：多轮讨论确认当前多 agent 编排与主流（LangGraph `create_supervisor` 等）不匹配，需要调整：
+> supervisor 只是纯路由分类器（不会调工具、不持有对话），没有"主 agent"，导致 agentic 记忆召回无法实现；
+> 记忆召回是入口固定闸门（实体命中 + 指代词门控向量），时机死板、易漏召；
+> 召回侧实体抽取用正则，而存储侧 episode 实体已是 LLM 蒸馏产出，两侧口径不一致。
+> **状态**：表 1 / 表 2 / 表 3 已确认，已于 2026-09-18 按 #31→#37 执行完成（代码改动见 graph.py；thread_id 采用标准 `InjectedState` 注入，非 contextvar 兜底）。
+
+### 关联 todo（执行顺序 #31–#37）
+
+| todo | 主题 | 对应表3编号 |
+|---|---|:---:|
+| e1 | supervisor 升级为工具调用主 agent（挂 handoff + search_memory） | #31 |
+| e2 | 撤掉 recall_node 固定闸门，召回逻辑搬进 search_memory 工具 | #32 |
+| e3 | 召回侧实体抽取从正则换 LLM，与蒸馏侧对齐 | #33 |
+| e4 | 新增 search_memory 记忆检索工具 | #34 |
+| e5 | 新增 handoff 工具，暴露三子 agent 给主 agent | #35 |
+| e6 | 图结构接线调整（去入口固定召回，主 agent 自驱循环） | #36 |
+| e7 | 子 agent 封装保持不变，仅作为 handoff 目标 | #37 |
+
+### 表 1：目前代码的问题（与主流做法不匹配处）
+
+| # | 问题（现状） | 与主流做法的差异 | 后果 |
+|---|---|---|---|
+| 1 | **supervisor 是纯路由分类器**（`with_structured_output(RoutingDecision)`），不会调工具，没有"持有对话的主 agent" | 主流 supervisor 本身是 `create_react_agent`，挂 handoff 工具委托子 agent、可挂 memory 工具自决记忆 | agentic 记忆召回无法在 supervisor 实现；架构偏离最常见的 supervisor 拓扑 |
+| 2 | **记忆召回是入口固定闸门** `recall_node`（实体命中 + 指代词门控向量），强注 SystemMessage，每轮入口必走判断 | 主流由主 agent 推理时按需调 `search_memory` 工具，无"入口强注" | 召回时机死板：用户没用指代词但指代旧上下文时漏召；且无法与推理结合 |
+| 3 | **召回侧实体抽取用正则** `_extract_entities_from_text`（graph.py:365），而存储侧 episode 实体已是 LLM 蒸馏产出，两侧口径不一致 | 主流召回侧与蒸馏侧实体抽取方法一致（都用 LLM） | 正则漏抽的实体（如自然语言订单描述）匹配不到已存 LLM 实体，召回质量受限 |
+
+### 表 2：整体调整事项
+
+| 事项 | 一句话说明 | 修的问题 |
+|---|---|---|
+| A | **supervisor 升级为真实主 agent**：`create_react_agent` 封装，持有对话、挂 handoff 工具（order/qa/ticket）+ `search_memory` 工具 | #1 |
+| B | **撤掉 `recall_node` 固定闸门**：记忆召回改由 supervisor 的 `search_memory` 工具推理时自决，不再每轮入口强注 | #2 |
+| C | **召回侧实体抽取换 LLM**：新增 LLM 实体抽取，与蒸馏侧对齐；`search_memory` 内部用 LLM 实体做精确召回 | #3 |
+| D | **图结构接线调整**：入口不再 `recall→compress→supervisor` 固定闸门；改为 supervisor 主 agent 自驱循环（handoff 调子 agent），`answer` 整合保留 | #1/#2 |
+
+### 表 3：详细调整点
+
+| 编号 | 位置 | 现状 | 要改成 | 对应事项 | 时间 | 改动内容 |
+|---|---|---|---|---|---|---|
+| #31 | 路由/调度节点 | 调度环节只是个"分类器"，把用户问题硬判成某类后转给对应专家，它自己不会使用任何工具，也不持有对话过程 | 把调度环节升级成一个真正会调用工具的主智能体，由它在推理时自己决定"要不要先查记忆、交给哪个专家、还是直接回答" | A | 2026-09-16 | 把原分类器函数替换为用 `create_react_agent` 封装的 `supervisor_agent`，工具列表挂上 `transfer_to_order`/`transfer_to_qa`/`transfer_to_ticket`/`search_memory` 与 `SUPERVISOR_PROMPT`；`supervisor(state)` 改为调用该 agent；删除 `RoutingDecision` 结构化输出与基于 `next` 枚举的 `route` 条件路由 |
+| #32 | 入口召回节点 | 每轮对话最前面放了一道"强制闸门"，命中实体或命中指代词时才去翻记忆并塞进上下文 | 撤掉这道入口强制闸门，记忆查找交给主智能体在思考时按需调用工具决定，不再每轮开头无脑判断 | B | 2026-09-16 | 删除 `recall_node` 函数及 `START→recall` 边；把其中拼装召回消息的逻辑（`_build_recall_message` 等）复用到新增的 `search_memory` 工具内 |
+| #33 | 实体抽取函数 | 从用户这句话里抽实体（订单号/工单号等）用的是固定正则规则，只能匹配写死的几种写法 | 改用大模型抽实体，和记忆落库时抽实体的方式保持一致，覆盖正则匹配不到的自然语言表述 | C | 2026-09-16 | 删除 `_ENTITY_PATTERNS` 正则表与 `_extract_entities_from_text` 正则函数（或保留作兜底），新增 `extract_entities_llm(text)`；召回与 `search_memory` 内改用该函数 |
+| #34 | 新增记忆检索工具 | 目前没有可供智能体主动调用的"查记忆"工具 | 新增一个记忆检索工具，让主智能体在需要时主动调用它去翻历史情景记忆 | A/C | 2026-09-16 | 新增 `search_memory(query)` 工具函数，内部先做 LLM 实体抽取走 `search_episodic_by_entities`，再对 query 向量化走 `search_episodic_by_vector`，超阈值返回片段 |
+| #35 | 新增 handoff 工具 | 三个专家子智能体只能被调度节点用"分类→分发"的方式叫起，没有作为工具暴露 | 把三个专家包装成主智能体可调用的"转交"工具，主智能体靠调工具把任务交给对应专家 | A | 2026-09-16 | 用 `create_handoff_tool`（或手写 `transfer_to_order`/`transfer_to_qa`/`transfer_to_ticket`）把三个子 agent 注册为 `supervisor_agent` 的工具 |
+| #36 | 图结构接线 | 流程图是"入口先强制召回→压缩→调度分类→按类别分发专家→压缩→循环→汇总"，召回写死在入口 | 流程图改为"入口压缩→主智能体自驱循环"，主智能体通过转交工具调专家，去掉入口固定召回那一步，最终汇总节点保留 | B/D | 2026-09-16 | 改 `add_edge` 配置：去掉 `recall` 节点及 `START→recall`、`recall→compress` 边；改为 `START→compress→supervisor`；`supervisor` 成为循环核心；`answer_node` 保留作最终整合 |
+| #37 | 子 agent 封装 | 三个专家子智能体各自只挂着自己业务相关的工具 | 保持不变，仅作为主智能体转交工具的目标；专家自身不需要再挂记忆工具 | A | 2026-09-16 | `_make_subagent` 封装逻辑不变；仅新增 `transfer` 工具指向它们 |
+
+### 执行状态（十五：#31–#37 已全部落地，2026-09-18）
+
+- [x] #31 supervisor 升级为 `create_react_agent` 主 agent（挂 handoff + search_memory），删除 `RoutingDecision` / `route` 分类器
+- [x] #32 删除 `recall_node` 固定闸门；召回逻辑迁入 `search_memory` 工具（复用 `_build_recall_message`）
+- [x] #33 实体抽取从正则 `_extract_entities_from_text` 换 LLM `extract_entities_llm`（与蒸馏侧对齐）
+- [x] #34 新增 `search_memory` 记忆检索工具（实体 LLM + 向量语义混合召回）
+- [x] #35 新增 handoff 工具 `transfer_to_order/qa/ticket` + `finish`（均返回 `Command(goto=..., graph=Command.PARENT)`）
+- [x] #36 图结构重连：`START→compress→supervisor`（主 agent 子图节点）；handoff/finish 经 `Command` 跳转；`supervisor→answer` 默认边；子 agent→compress→supervisor 循环
+- [x] #37 子 agent 封装 `_make_subagent` 不变，仅作为 handoff 目标
+
+> **thread_id 注入方式（主流做法）**：采用 LangGraph 标准 `InjectedState`——为主 agent 子图定义 `SupervisorState(messages, thread_id)`，并把 `create_react_agent(state_schema=SupervisorState)`；`search_memory` 工具签名 `thread_id: Annotated[str, InjectedState("thread_id")]`，由框架在工具调用时从子图状态注入，LLM 不可见该参数。早期曾用 `contextvars` 作临时兜底，已回退为标准 `InjectedState`（用户要求按正式上线写法）。
+
+> 校验：`python -m py_compile graph.py` 通过；未实跑（langgraph/langchain/psycopg 依赖与 PG 环境由用户自理）。
+
+---
+
+## 十六、第五轮：子 agent 独立上下文（2026-09-17 提出，2026-09-18 执行完成）
+
+> **起因**：多轮讨论确认当前子 agent 调用时直接吃全量主上下文（`state["messages"]` 含所有历史轮 + 其他专家已产出的结论），与主流"子 agent 只看与本任务相关的精简上下文"不符；且当前靠硬路由 `route()` `invoke` 全量 state，缺少"主 agent 把任务包交给子 agent"的接口。升级到十五 #35（handoff）后须补上 payload 传递，否则独立上下文落空。
+> **状态**：表 1 / 表 2 / 表 3 已确认，已于 2026-09-18 按 #41→#43 执行完成（十五 #35 已落地）。
+
+### 关联 todo（执行顺序 #41–#43）
+
+| todo | 主题 | 对应表3编号 |
+|---|---|:---:|
+| f1 | 新增上下文裁剪函数 `_scope_for_subagent` | #41 |
+| f2 | 子 agent 调用处改用精简上下文（不再传全量 state） | #42 |
+| f3 | handoff 集成：子 agent 经 payload 收任务包（依赖十五 #35） | #43 |
+
+### 表 1：目前代码的问题（与主流做法不匹配处）
+
+| # | 问题（现状） | 与主流做法的差异 | 后果 |
+|---|---|---|---|
+| 1 | **子 agent 调用时吃进全量主上下文**：直接把整份主上下文（含之前所有轮历史 + 其他专家已产出的结论）丢给子 agent | 主流多 agent 里子 agent 只接收**与本任务相关的精简上下文**（最新用户请求 + 主 agent 委派指令 + 必要的相关记忆），不是整份会话历史 | token 浪费（每个子 agent 都背全量）；不同专家结论互相污染；无法隔离；长会话极易超窗 |
+| 2 | **没有"委派 payload"机制**：当前靠硬路由 `route()` 直接 `invoke` 全量 state，缺少"主 agent 把一份任务包交给子 agent"的接口 | 主流（handoff 模式）下子 agent 通过 handoff 传入的 payload 收任务，而非读全量 state | 升级到十五 #35 后若不改，子 agent 仍会吃全量，独立上下文落空 |
+
+### 表 2：整体调整事项
+
+| 事项 | 一句话说明 | 修的问题 |
+|---|---|---|
+| A | **子 agent 输入上下文裁剪**：调用处先构造"任务相关"精简消息，再传给子 agent，不再传全量 state | #1 |
+| B | **配合 handoff（十五 #35）**：子 agent 经 handoff 收到委派 payload，而非读全量 state | #1/#2 |
+| C | **明确子 agent 无状态**：每次委派拿 fresh 任务包，跑完即弃，不背跨轮 | #2 |
+
+### 表 3：详细调整点
+
+| 编号 | 位置 | 现状 | 要改成 | 对应事项 | 时间 | 改动内容 |
+|---|---|---|---|---|---|---|
+| #41 | 上下文裁剪函数（graph.py 新增） | 无（子 agent 一直吃全量） | 新增一个裁剪函数：取最新一条用户请求 + 主 agent 委派语 + 按需注入的检索结果，剔除其他专家结论与老旧历史，输出一份精简消息 | A | 2026-09-17 | 新增 `_scope_for_subagent(state, agent_name)`，返回精简 messages 列表；检索结果可复用 answer_node 已注入的召回内容 |
+| #42 | 子 agent 调用/委派处（graph.py `_run_subagent`） | 调用子 agent 时把整份主上下文直接 `invoke(state)` 丢进去 | 改为先经 #41 裁剪，再传精简上下文；子 agent 不再看全量历史与其他专家结论 | A | 2026-09-17 | `_run_subagent` 内把 `agent.invoke(state)` 改为 `agent.invoke({"messages": _scope_for_subagent(state, agent_name)})` |
+| #43 | handoff 集成（配合十五 #35） | handoff 工具未定义，子 agent 靠 `route()` 硬分发生全量 state | 升级到 handoff 后，子 agent 通过 handoff 传入的 payload 接收任务包（payload 即 #41 的精简上下文），而非读全量 state | B/C | 2026-09-17 | `create_handoff_tool(..., add_messages=...)` 或 `transfer_to_*` 里把 `_scope_for_subagent` 产物作为 payload；子 agent 以该 payload 初始化上下文（十五 #35 落地后 #42 的 `_run_subagent` 路径被 handoff 取代） |
+
+### 执行状态（十六：#41–#43 已全部落地，2026-09-18；依赖十五 #35 已落地）
+
+- [x] #41 新增 `_scope_for_subagent(state, agent_name)`：仅取最新一条用户消息构造「独立上下文」
+- [x] #42 `_run_subagent` 改用 `_scope_for_subagent` 精简上下文（不再传全量 state）
+- [x] #43 handoff 集成：子 agent 经路由跳转到对应节点后，`_run_subagent` 内部以精简上下文（= 任务包）初始化，而非读全量 state；结论带 `metadata.type=subagent_conclusion` 供 `answer_node` 精准收集
+
+> 说明：十六采用「简化形态」——委派 payload 即 `_run_subagent` 内部裁剪出的独立上下文，而非 handoff 工具的 `add_messages` 参数。原因：本 demo 子 agent 无状态、本身只回结论，弱化 payload 入参即可满足隔离诉求；生产若需把委派语/检索结果显式随 handoff 传入，可升级为 `create_handoff_tool(..., add_messages=...)` 在 payload 中携带。
+
+> **补丁（2026-09-19）：补上 #41 欠的「主 agent 委派指令」。** 原 `_scope_for_subagent` 只取最新一条用户消息，漏了计划里写的委派指令一项（检索结果已由委派指令隐含覆盖）。现已补全：
+> - `AgentState` 新增覆盖式字段 `delegated_request`；
+> - `transfer_to_*` handoff 工具新增 `request` 参数（supervisor LLM 填分解后的具体子任务），经 `Command(goto=..., graph=Command.PARENT, update={"delegated_request": request})` 随 handoff 写入父图状态；
+> - `_scope_for_subagent` 优先用 `delegated_request` 作为子 agent 上下文，缺失才退化到最新用户消息；
+> - `SUPERVISOR_PROMPT` 增加指引：request 写成分解后的明确指令（含实体），同一诉求多子任务分别委派。
+> 此补丁同时把 #43 的「委派语随 handoff 携带」补上一半（委派指令已随 handoff 走）；裁剪位置仍在节点内，属已注明的简化形态。
+
+> 校验：`python -m py_compile graph.py` 通过；未实跑（依赖与 PG 环境由用户自理）。
+

@@ -180,3 +180,45 @@ Get-ChildItem -Recurse -File | Where-Object { $_.Length -gt 100MB } |
 关于这个其实不是主流的做法吧 多agent的场景下是不是子agent有自己的上下文；自己的上下文一般总哪里来呢 
 
 5.关于工作记录的持久化
+
+
+6.多agent架构
+那"多个 agent + 一个纯路由分类器"（1.0）主流吗？给个准确版图：
+主流拓扑 ① Supervisor/Manager（最常见）：supervisor 本身就是个会调工具的 agent，持有对话、挂 handoff 工具（必要时还挂 memory 工具），由它决定委托谁、或直接答。这是 LangGraph create_supervisor 的默认形态。
+拓扑 ② Router/Dispatcher（你 demo 用的）：轻量分类器把请求丢给自包含专家。生产里确实存在（尤其"先分类再分发"的客服流水线），但 router 不推理、不会用工具，所以没那么"agentic"，在多 agent 里不如 ① 常见。
+拓扑 ③ Network（peer-to-peer 互转，无中心）
+
+---
+
+## 速答：主 agent 与子 agent 怎么交互（handoff 模式）
+
+> 适用问题："你的多 agent 怎么协作？""supervisor 和子 agent 怎么通信？""handoff 是什么？"
+> 目标：30~60 秒讲清机制 + 一句对比显深度，别陷进代码细节。
+
+**一句话总览**
+主流（LangGraph supervisor）里，主 agent 和子 agent 的交互是通过 **handoff（转交）工具** 实现的：子 agent 以"工具"的形式挂到主 agent 上，由主 agent 的 LLM **自己决定**何时转交给谁——本质还是工具调用，不是硬编码分发。
+
+**handoff 到底是什么（本质）**
+- 它**底层就是一个普通 tool**（有名字 + JSON schema，LLM 能调）。
+- 和普通工具（如 search_memory）的唯一区别在**副作用**：普通工具返回"观察结果"；handoff 工具被调用后触发**图的控制权转移**（等价于 `Command(goto=子agent节点)`），框架把执行切到子 agent。
+- 对 LLM 而言两者无差别——都是"该不该调这个工具"的决策；框架才把这次调用解释成"换人上"。
+
+**一轮交互流程（讲这个最直观）**
+1. 主 agent 收到用户问题，结合上下文推理；
+2. 决定调用某个 handoff 工具（如 `transfer_to_qa`）；
+3. 框架切到对应子 agent 节点，子 agent 用自己的业务工具跑完任务；
+4. 子 agent 结果交回主 agent；
+5. 主 agent 决定：再派别的专家 / 直接整合作答 / 或先调记忆工具。
+→ 控制权始终能回到主 agent，所以多专家协作、汇总都由它收口。
+
+**和本 demo（1.0 路由分类器）的区别（防追问关键）**
+- demo 1.0：supervisor 是**分类器返回枚举** + `route()` **硬编码选边**分发——派单写死，LLM 不参与"派谁"；
+- 主流：派单是 **LLM 决策的 handoff 工具调用**——更 agentic、更鲁棒（用户原话出现"订单"却问别的，枚举路由易误判，handoff 不会）。
+→ 一句话点出这个差异，比只背概念显得真做过。
+
+**两个易漏的重点（加分项）**
+- **子 agent 应有自己的上下文，不是背全量主上下文**：主流子 agent 只拿和本任务相关的消息（handoff 传入的 payload / 裁剪后上下文），而非整份 state。省 token、做隔离。⚠️ 本 demo 1.0 让子 agent 看全量 `state["messages"]`，是和主流不符的点，真实项目要切。
+- **主 agent 持有对话与决策，子 agent 是无状态专家**：子 agent 跑完即弃，不持有跨轮状态；跨轮连续性在主 agent / checkpointer。
+
+**收尾的一句话**
+"所以是「主 agent 编排 + handoff 工具转交，LLM 驱动而非写死枚举」；子 agent 是无状态专家、跑完交回主 agent 做整合——协作靠工具调用，不是写死的 if/else 路由。"

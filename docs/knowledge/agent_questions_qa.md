@@ -61,6 +61,8 @@
 - `handoff` 是 OpenAI 封装好的"把对话移交给另一个 Agent"的能力，模型自己决定交给谁。
 - 在 SDK 里 **Handoff 底层就是把"转给另一个 Agent"伪装成一个特殊工具**给模型选。`tool_name_override="transfer_to_faq_agent"` 是**自定义这个交接工具显示的名字**，让模型更清楚用途、更可控可读。
 
+一句话总结（面试用）
+handoff 不是 OpenAI 独有。它描述的是"多 Agent 间把控制权/任务路由给另一个 Agent"这一通用编排模式。OpenAI 把它做成了内置原语 handoff；LangChain/LangGraph 用 Supervisor 图路由实现等价效果，后来又补了 create_handoff_tool 和 langgraph-swarm 对齐；AutoGen、CrewAI 也各有等价机制，只是命名不同。我们 demo 的 supervisor→专家节点路由，本质上就是 handoff。
 ---
 
 ## Q7. `with trace(...)` 是什么？
@@ -365,31 +367,91 @@ if __name__ == "__main__":
 
 ## Q19. Tool 式 Router，200 个技能的描述要全写进 tool 的 description 吗？企业会优化吗？
 
-**A：** 用 Tool 方式做 Router，这 200 条 `(key, description)` 确实会**全部塞进 `description_override`**。这正是 Tool 式 Router 的硬伤：
+**A：** 若不加路由层、直接用 Tool 方式把 200 条 `(key, description)` 硬塞进 `description_override`，这正是它的硬伤：
 
 - description 变几百上千字，占每轮 input tokens；
 - 模型从一长串里挑，长上下文下挑选准确率下降；
 - 每次对话都带这 200 条，浪费且笨重。
 
-**企业一定会优化**，主流做法：
+**工具/技能一多就要先做一层路由预筛**，把候选从几百砍到几个再交给模型挑。
+
+**技能少（< 20）不用建路由层**：直接把技能注册为工具或列进上下文，模型自己挑即可（也就是你 demo 里 supervisor 直接路由专家节点的做法）。
+
+企业里技能变多后的主流"先路由预筛"方案：
 
 | 方案 | 做法 | 适用 |
 |---|---|---|
-| A. Tool 式（原样） | 全量 description 塞进 tool desc | 技能数 < 20 |
 | B. 分类预筛 + Tool | 先按业务域分 8~10 大类，tool desc 只列大类；选中后再从该类挑 | 中等规模 |
-| C. 向量检索预筛 + Tool | 用户问题先 embedding，从 200 个里召回 top-5 写进 desc | 最精准，desc 永远短 |
-| D. Router Agent + RAG | 轻量 Agent 做路由，目录走检索召回 | 平台级 |
+| C. 向量检索预筛 + Tool | 用户问题先 embedding，从全部技能里召回 top-K 写进 desc | 技能多、最精准 |
+| D. Router Agent + RAG | 轻量 Agent 做路由，技能目录走检索召回 | 平台级（技能极多/动态） |
 
-**真实企业里 C / D 最常见**——几乎没人把 200 条硬塞进工具描述。你的直觉"工具描述一般字数不多"是对的，Tool 式只适合技能数少的场景。
+**B / C / D 是技能变多时的主流**，尤其 C / D 最常见——几乎没人把几百条硬塞进工具描述。你的直觉"工具描述一般字数不多"对，因为真实企业靠路由层把 desc 长度控死。
+
+**B / C / D 具体怎么实现（对比 demo 的静态注册）：**
+
+demo 是把 3 个专家 Agent **定义时就静态注册**进图、模型直接挑——这只在技能少时扛得住。B/C/D 的核心是：**不一次性把全部技能注册给模型，而是先预筛、只把"当前候选小集合"交给模型**。
+
+- **B 分类预筛（写一个选领域工具）**：写一个 `select_domain` 工具，description 只列 8~10 个大类（如 财务/安全/售后）。模型先调它选大类 → 框架按大类从"技能目录数据"（`dict: 大类 → [子技能]`）里**动态加载该大类的子技能**并注册（或再挂一个只列本类子技能的 `select_skill` 工具） → 模型在小区内挑具体技能。子技能是存成目录数据的，不是写死成 200 个 Agent，所以任意时刻模型可见的工具数都很短。
+  - 回答你的疑问：大类内部的子技能"可以像 demo 一样直接注册"，但关键是**只注册当前大类的那几个**，不是 200 个全注册；切换大类时换一套注册。本质是用一层粗选把候选从 200 砍到十几。
+   ```python
+    # ── 1) 技能目录 = 纯数据（不是 200 个 Agent 类）──────────────
+    SKILL_CATALOG = {
+        "finance": [   # 财务大类，下面十几条子技能
+            {"key": "finance_policy", "desc": "报销标准/财务合规/预算审批"},
+            {"key": "invoice",        "desc": "开发票/发票查验"},
+            # ... 共十几条
+        ],
+        "security": [
+            {"key": "data_security",  "desc": "数据脱敏/权限/隐私合规"},
+            # ...
+        ],
+        "aftersale": [ ... ],
+        # ... 共 8~10 个大类，每类十几条  → 总 200 条
+    }
+
+    # ── 2) 只注册一个"选领域"工具，description 只列大类名 ──────
+    DOMAINS = "/".join(SKILL_CATALOG.keys())   # 财务/安全/售后/...
+
+    @tool(name_override="select_domain",
+        description_override=f"用户问题属于哪个业务域？可选：{DOMAINS}")
+    def select_domain(domain: str) -> str:
+        # 框架在 tool_call 阶段就截获 domain，函数体不会真执行业务
+        return f"已选领域：{domain}"
+
+    # ── 3) 主 Agent 启动只挂 select_domain，不挂任何具体技能 ──
+    main_agent = Agent(tools=[select_domain])   # 模型一开始只看见"选领域"这一个工具
+
+
+    # ── 4) 运行时：模型选完大类后，动态注册该大类的子技能 ──────
+    def make_select_skill_tool(skills):
+        """临时造一个只列"本类子技能"的 select_skill 工具"""
+        desc = "从下列技能选最匹配的 skill_key：\n" + "\n".join(
+            f"- {s['key']}: {s['desc']}" for s in skills)
+        @tool(name_override="select_skill", description_override=desc)
+        def select_skill(key: str) -> str:
+            return f"已选：{key}"
+        return select_skill
+
+    # 框架在截获 select_domain 的返回后调用：
+    def on_domain_selected(domain):
+        sub = SKILL_CATALOG[domain]              # 只取这一类的十几条
+        skill_tool = make_select_skill_tool(sub)
+        main_agent.tools = [select_domain, skill_tool]   # 动态换注册
+        # 模型现在只在 [选领域, 本类十几条] 里挑，从 finance 十几条选具体 key
+
+
+    # ── 5) 模型选出 skill_key 后，框架按 key 加载技能内容注入 ──
+    # load_skill_content(skill_key) → 注入 prompt，开始真正作答
+  ``` 
+
+
+- **C 向量预筛（每轮动态填描述）**：构建期把所有技能 description embed 入库（带 `skill_key` 元数据）。请求期把用户问题 embed，向量召回 top-K（如 5）条 → **动态拼进 `select_skill` 工具的 description**（或塞进上下文） → 模型从这 5 条里挑。工具描述每轮按召回结果现填，永远不长。
+- **D Router Agent + RAG（路由也交给专职 Agent）**：单独起一个轻量 Router Agent（小模型，如 gpt-4o-mini），给它一个 `search_skills(query)` 检索工具（走向量库查技能目录），它调用后返回 `skill_key`，框架再加载对应技能内容。等于把"路由"本身外包给一个专职 Agent，而不是主 Agent 兼做。
 
 ---
 
-## Q20. Tool 式 vs Agent 式 Router 怎么写？instructions 是 system prompt 吗？
+## Q20. Agent 式 Router 怎么写？instructions 是 system prompt 吗？
 
-**A：**
-
-### Tool 式（之前示例）
-即 `@tool(name_override="select_skill", description_override=...)` + `select_skill` 函数，挂到主 Agent 的 `tools=[...]`。函数体空跑、框架在 tool_call 阶段截获 key。
 
 ### Agent 式（改造写法）
 **不是"把那段 JSON 放进 instructions"**，而是单独起一个轻量 Router Agent，把目录作为上下文写进它的 `instructions`：
