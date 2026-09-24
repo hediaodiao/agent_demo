@@ -387,6 +387,8 @@ if __name__ == "__main__":
 
 **B / C / D 是技能变多时的主流**，尤其 C / D 最常见——几乎没人把几百条硬塞进工具描述。你的直觉"工具描述一般字数不多"对，因为真实企业靠路由层把 desc 长度控死。
 
+**工具和技能通用**：B/C/D 的路由逻辑与目录项是"工具"还是"技能"无关——本质都是"大目录 → 选相关子集"。唯一差别在选中之后：工具是注册给 Agent 去**调用执行**，技能是 `load_skill_content` 把内容**注入 prompt 作指引**（本文 skills 本就借 `select_skill` 工具来选，选完才分流）。生产里通常把工具、技能（甚至子 Agent）放进**同一个向量库**，用 `type` 字段（tool / skill / agent）区分、共享一套 embedding；检索时跨类型召回再按 type 过滤，或限定 type 检索皆可，一套链路最省事。
+
 **B / C / D 具体怎么实现（对比 demo 的静态注册）：**
 
 demo 是把 3 个专家 Agent **定义时就静态注册**进图、模型直接挑——这只在技能少时扛得住。B/C/D 的核心是：**不一次性把全部技能注册给模型，而是先预筛、只把"当前候选小集合"交给模型**。
@@ -446,7 +448,75 @@ demo 是把 3 个专家 Agent **定义时就静态注册**进图、模型直接�
 
 
 - **C 向量预筛（每轮动态填描述）**：构建期把所有技能 description embed 入库（带 `skill_key` 元数据）。请求期把用户问题 embed，向量召回 top-K（如 5）条 → **动态拼进 `select_skill` 工具的 description**（或塞进上下文） → 模型从这 5 条里挑。工具描述每轮按召回结果现填，永远不长。
+
+  > 注：纯稠密 embedding 有**词汇不匹配**硬伤（用户口语"改期会议"匹配不到工具名 `calendar_event_update`）。生产建议**稠密 + 稀疏(BM25 关键词) 混合检索 + RRF 融合**：同一句用户问题同时跑向量召回和关键词召回，再融合排序（BM25 擅长抓精确术语/方法名）。且仅靠初始 query 单轮检索会漏掉多步任务中途所需工具，40+ 规模需叠加"上下文重排"——即意图分类（先砍 80% 工具库）+ 领域内混合检索 + 按已调工具/返回状态重排候选的分层路由。
+
+关于稀疏(BM25 关键词) 关键词的来由：不是模型调用给的，而是代码实现的
+构建期和请求期两条线：
+构建期：把每个工具的名称/描述/tags 分词，建成 BM25 索引（一次性）。
+请求期：把用户问题分词 → 拿这些 token 去 BM25 索引打分 → 和稠密路融合
+
+也就是“请求期把用户问题 embed，向量召回 top-K（如 5）条 ”这个部分可以写成一个agent的工具，也可以是框架层的固定流程（确定性步骤），比如一般会加个判断，if len(tools) > 50: 才做检索（工具少就不检索，全注册），更常见的是前者（见下方关于前者更进一步的解释）
+
+  **更稳的写法（推荐，即 Tool RAG 自检索）**：干脆不要这个硬编码闸门，直接永远给主 Agent 挂一个 `retrieve_tools(query)` 检索元工具，让 Agent 自己决定何时检索、漏了再检索。它同时解决"预筛触发"和"漏检兜底"两件事——框架预筛若把正确工具排在 K+1 之外，主 Agent 因看不见而整轮失败；而 Agent 自带检索工具可自愈（发现候选不合适就再调一次）。这本质是把上面的 C（框架注入 top-K）改成"由 Agent 自己调的检索工具"，也是 LangGraph BigTool 等被引用最多的 Tool RAG 实现。**区别于 D**：D 是另起一个独立 Router Agent 带 `search_skills` 工具；这里是主 Agent 自己带 `retrieve_tools`，少了一次跨 Agent 交接、上下文更连贯。
+
 - **D Router Agent + RAG（路由也交给专职 Agent）**：单独起一个轻量 Router Agent（小模型，如 gpt-4o-mini），给它一个 `search_skills(query)` 检索工具（走向量库查技能目录），它调用后返回 `skill_key`，框架再加载对应技能内容。等于把"路由"本身外包给一个专职 Agent，而不是主 Agent 兼做。
+
+**规模再大（40+ 工具）的分层路由**：工具到几十上百时，单靠 C 的一次性向量召回不够稳，生产用三层：
+
+- **L1 意图分类**：轻量分类器/小模型把请求映射到粗粒度领域（如 财务/日历/订单），先砍掉约 80% 工具库；
+- **L2 领域内混合检索**：在选中领域内跑稠密 + BM25（见 C 注），领域缩小后更准、token 更少；
+- **L3 上下文重排**：多步任务里不只按**初始 query** 检索，而是按"已调工具 + 返回结果"这一**当前状态**重排候选。例：用户说"我想买东西"，第 1 步调了"创建订单"，第 2 步相关的是"添加商品/用优惠券"——这些相关是因为"当前已有订单"这个状态，不是原始那句提到了它们。把状态喂回检索器，每步给出当下最相关的几个工具。
+
+  > 实现关键：检索的 **`query` 参数不锁死成用户原话**。框架一次性注入（C）内部写死 `embed(user_msg)`，候选集第 1 步就冻住，后面步骤需要的工具若没进初始 top-K 就永远看不见；而自检索形式里 `retrieve_tools(query)` 的 `query` **由 Agent 填**——第 1 步传用户原话，第 2 步传状态增强串（如 `"刚创建了订单123，下一步加商品还是用券"`），候选集每步刷新。若用手写框架检索，则把"已调工具 + 返回摘要"拼接到 query 字符串再 embed/BM25 即可（状态增强 query）。
+
+> 注：以上都是"工具多"的应对。若**子 Agent 本身不多**（常见情况，几个到十几个专家 Agent），无需把 Agent 也 embed 进向量库——直接像你 demo 的 supervisor 那样把子 Agent 注册给主 Agent 即可，只需对"工具"做 B/C 检索（或挂 `retrieve_tools`）。只有 Agent 数量也极大（如几十个 MCP server、几百工具的平台级联邦）时，才需要把"工具 + 子 Agent"放进同一向量空间按元数据检索（即 D 的"平台级"场景），普通项目不必。
+
+## 附：BM25 关键词检索（工具检索 & 知识库 RAG 通用）
+
+**① 关键词来源是代码分词，不是模型调用。** 构建期把每个检索单位（工具：name+description+tags；知识库：每个 chunk 内容）分词，建倒排索引 + 文档频率（DF）统计；请求期把用户问题也分词，拿 token 去索引打分，再和稠密向量路 RRF 融合。
+以下以"工具检索"为例（知识库场景把 `tools` 换成 `chunk_id → 文本` 字典、每个 chunk 独立分词即可，逻辑完全一致）：
+
+```python
+import math, jieba
+from collections import defaultdict
+
+# 工具元数据：每个工具的 name/description/tags，本就存在（代码或DB），无需额外字段
+tools = {"calendar_event_update": {"name":"calendar_event_update",
+            "desc":"改期会议","tags":["日历","会议"]}}
+
+# ── 构建期：把工具变成"关键词集合"并建立倒排+DF统计（一次性）──
+def build_index(tools):
+    docs, df = {}, defaultdict(int)   # docs: 工具id→分词列表; df: 词项→含它的文档数
+    for tid, m in tools.items():      # 遍历每个工具
+        # 把 name+desc+tags 拼成一段文本，再用 jieba 分词成 token 列表
+        toks = list(jieba.cut(" ".join([m["name"], m["desc"]] + m["tags"])))
+        docs[tid] = toks              # 存下该工具的分词结果（关键词集合）
+        for t in set(toks): df[t] += 1  # 统计每个词项出现在几个工具里（文档频率DF）
+    return docs, df, len(docs)        # 返回：分词表、词频统计、工具总数N
+
+docs, df, N = build_index(tools)      # 执行一次构建，索引常驻内存
+
+# ── 请求期：拿到用户问题，现算 BM25 分数（每次query不同，分数不能预存）──
+def bm25(query, k1=1.5, b=0.75, avgdl=10):
+    scores = defaultdict(float)        # 每个工具的累计得分
+    for tid, toks in docs.items():     # 遍历所有工具（也可用倒排只遍历命中的）
+        dl = len(toks); tf = defaultdict(int)  # dl=该工具文档长度; tf=本工具内词频
+        for t in toks: tf[t] += 1      # 统计该工具每个词出现几次（词频TF）
+        for qt in set(jieba.cut(query)):  # 把用户问题也分词，逐词判断
+            if qt in df:               # 只有"问题里也出现的词"才得分（关键词重合）
+                fr = tf.get(qt, 0)     # 该词在工具里出现几次（词频）
+                idf = math.log((N-df[qt]+0.5)/(df[qt]+0.5)+1)  # 越罕见越重要
+                scores[tid] += idf * fr*(k1+1)/(fr + k1*(1-b+b*dl/avgdl))  # BM25 词项得分
+    return scores                      # 各工具得分，再和稠密向量路 RRF 融合
+```
+
+**② 打分本质：只看字面词项重合，不理解语义。** 只有 query 和文档都出现的词才得分；得分高低由 TF（词频，饱和增长）、IDF（越罕见越重要，专名/编号高）、文档长度（长文惩罚）共同决定。因此"改期"和"重新安排"在 BM25 下不重合、不得分——这正是要叠稠密向量的原因。**分数依赖每次 query，query 相关、不能预存**，存的是索引结构而非分数值。
+
+**③ 存储分两种规模：**
+- **工具检索（几十~几百）**：可纯内存（`docs` 分词表 + `df` 统计放 dict），工具主表无需新增字段；缺点是每次重启重跑构建期重新分词（毫秒~秒级可忽略）。
+- **知识库 RAG（万~百万 chunk）**：必须持久化——Elasticsearch/OpenSearch（原生 BM25，每个 chunk 当一个 doc）、SQLite FTS5、或自管倒排表（`bm25_inverted(token, chunk_id, tf)` + `bm25_stats(token, df)`）。**每个 chunk 作为独立单位分词，TF 按 chunk 内计**。
+- **不是"单独一个字段存 BM25 分数"**：存的是倒排 + TF + DF 结构，分数查询时现算。可选在 chunks/tools 表加 `search_text`/`tokens` 字段缓存分词结果（非必须）。
 
 ---
 
@@ -503,13 +573,18 @@ if skill_key != "none":
 - **Tool 式**：`@tool(name_override="select_skill", description_override=目录)` + `select_skill` 函数挂到主 Agent 的 `tools=[...]`。函数体空跑，框架在 tool_call 阶段截获 `skill_key` 去加载 content 注入 prompt（见 Q18）。
 - **Agent 式**：单独起轻量 Router Agent，把目录写进它的 `instructions`，模型直接输出 `skill_key`；Executor Agent 再 `instructions = BASE + content` 注入干活（见 Q20 代码）。
 
-> **C 与 D 是平行路线，不是"D = C + 多一步 Agent"**：
-> - C（向量检索预筛 + Tool）：用户问题 → 你的代码离线 embedding 召回 top-5 → 拼进 Tool 的 description → **主 Agent 调 `select_skill` 从 5 个里选 1 个**。
-> - D（Router Agent + RAG）：用户问题 → 离线召回 top-5 → 拼进 **Router Agent 的 instructions** → **Router Agent 输出 key** → Executor 注入。
-> 差别是"选择者"不同：C 选者=主 Agent；D 选者=独立 Router Agent（可用便宜小模型，路由/执行解耦、好测试）。
+> **C 与 D 是平行路线，不是"D = C + 多一步 Agent"**：两者都先用向量检索把候选从几百砍到几个，差别只是"谁做最终选择"：
+> - C（向量检索 + Tool）：**主 Agent 调 `select_skill` 从候选里选 1 个**——候选可由框架离线召回 top-5 拼进 desc，也可由主 Agent 自己调 `retrieve_tools(query)` 元工具检索（**自检索形态，推荐**）。
+> - D（Router Agent + RAG）：独立 Router Agent 调 `search_skills(query)` 检索工具（或框架离线召回拼进其 instructions）→ Router 输出 key → Executor 注入。
+> 差别是"选择者"不同：C 选者=主 Agent；D 选者=独立 Router Agent（便宜小模型，路由/执行解耦、好测试）。两条路线里检索都可有"框架离线"和"模型调用的工具"两种形态，后者让模型能自愈（重新检索兜底）更稳。
 
 ### 21.3 易混点：向量检索是 Tool 吗？
-**不是。** 向量检索（用户问题 → embed → 查向量库 top-5）是**你代码里在 `Runner.run` 之前预先跑的离线预处理**，结果直接拼进 Tool desc / Router instructions 的文本里。只有 `select_skill` 是 Tool。若把检索也做成 Tool 让模型自己决定"先检索再选"，那是更进阶的 **Agentic RAG**，非方案 C 标准做法。
+**看形态，不是非黑即白。** 向量检索（用户问题 → embed → 查向量库 top-K）有两种落地：
+
+- **框架离线条款**：检索在你代码里、`Runner.run` 之前预先跑完，结果拼进 Tool desc / Router instructions 的文本里。此时检索**不是 Tool**，只有 `select_skill`（C）或 Router 本身（D）参与模型调用——这是 21.2 两式的初始描述。
+- **工具形态（推荐，Tool RAG 自检索）**：把检索本身做成 `retrieve_tools(query)` / `search_skills(query)` 这样的**元工具**交给模型，由主 Agent（C 自检索）或 Router（D）自己决定何时检索、漏了再调。这就是 Agentic RAG，但**它已是生产最主流、最被引用（如 LangGraph BigTool）的做法，而非"非标准进阶"**——Q19 也把它列为更稳的推荐写法。
+
+所以"检索是不是 Tool"取决于用哪种形态：离线条款里不是，工具形态里是；后者因能自愈（重新检索兜底）而更稳，也是当前默认推荐。
 
 ### 21.4 规模化：200 个 Skills 怎么处理？
 Tool 式会把 200 条全塞进 description（占 token、长列表挑选率降），企业必优化：
